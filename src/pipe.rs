@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const PIPE_CAP: usize = 256 * 1024;
 
@@ -136,6 +136,7 @@ impl Pipe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn push_take_roundtrip() {
