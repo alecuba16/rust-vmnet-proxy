@@ -104,6 +104,13 @@ fn ensure_brew_formula() -> Result<(), String> {
 /// the daemon never starts against a missing directory.
 pub fn render_plist(prefix: &str, interface: &str, socket_path: &str) -> String {
     let prog = format!("{prefix}/bin/socket_vmnet");
+    // /var/run is tmpfs: the socket parent dir is gone after every reboot.
+    // socket_vmnet does not mkdir parents (verified: bind ENOENT), so wrap
+    // in sh -c and mkdir -p the parent before exec.
+    let parent = std::path::Path::new(socket_path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "/private/var/run".to_string());
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -113,10 +120,9 @@ pub fn render_plist(prefix: &str, interface: &str, socket_path: &str) -> String 
          \t<string>{LABEL}</string>\n\
          \t<key>ProgramArguments</key>\n\
          \t<array>\n\
-         \t\t<string>{prog}</string>\n\
-         \t\t<string>--vmnet-mode=bridged</string>\n\
-         \t\t<string>--vmnet-interface={interface}</string>\n\
-         \t\t<string>{socket_path}</string>\n\
+         \t\t<string>/bin/sh</string>\n\
+         \t\t<string>-c</string>\n\
+         \t\t<string>/bin/mkdir -p {parent} &amp;&amp; exec {prog} --vmnet-mode=bridged --vmnet-interface={interface} {socket_path}</string>\n\
          \t</array>\n\
          \t<key>RunAtLoad</key>\n\
          \t<true/>\n\

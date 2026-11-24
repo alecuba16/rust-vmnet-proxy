@@ -10,10 +10,9 @@ fn plist_contains_pinned_shape() {
         "/private/var/run/lima/socket_vmnet.bridged",
     );
     assert!(plist.contains("<string>com.alecuba16.rust-vmnet-proxy-vmnet</string>"));
-    assert!(plist.contains("<string>/opt/homebrew/opt/socket_vmnet/bin/socket_vmnet</string>"));
-    assert!(plist.contains("<string>--vmnet-mode=bridged</string>"));
-    assert!(plist.contains("<string>--vmnet-interface=en7</string>"));
-    assert!(plist.contains("<string>/private/var/run/lima/socket_vmnet.bridged</string>"));
+    assert!(plist.contains("<string>/bin/sh</string>"));
+    assert!(plist.contains("<string>-c</string>"));
+    assert!(plist.contains("/bin/mkdir -p /private/var/run/lima &amp;&amp; exec /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet --vmnet-mode=bridged --vmnet-interface=en7 /private/var/run/lima/socket_vmnet.bridged"));
     assert!(plist.contains("<key>RunAtLoad</key>"));
     assert!(plist.contains("<key>KeepAlive</key>"));
     assert!(plist.contains("<string>root</string>"));
@@ -25,11 +24,12 @@ fn plist_contains_pinned_shape() {
 #[test]
 fn plist_interface_and_socket_substituted() {
     let a = render_plist("/pfx", "en0", "/tmp/a.sock");
-    let b = render_plist("/pfx", "en1", "/tmp/b.sock");
+    let b = render_plist("/pfx", "en1", "/deep/nest/b.sock");
     assert!(a.contains("--vmnet-interface=en0"));
     assert!(b.contains("--vmnet-interface=en1"));
-    assert!(a.contains("/tmp/a.sock") && !a.contains("/tmp/b.sock"));
-    assert!(b.contains("/tmp/b.sock") && !b.contains("/tmp/a.sock"));
+    assert!(a.contains("exec /pfx/bin/socket_vmnet") && a.contains("/tmp/a.sock"));
+    assert!(b.contains("/bin/mkdir -p /deep/nest &amp;&amp;") && b.contains("/deep/nest/b.sock"));
+    assert!(!a.contains("/deep/nest") && !b.contains("/tmp/a.sock"));
 }
 
 #[test]
