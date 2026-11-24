@@ -130,8 +130,110 @@ struct ConfigRaw {
     socks_listen: Option<String>,
     mac: Option<String>,
     power_mode: Option<String>,
+    logging: Option<LogConfig>,
     ssh_legs: Option<Vec<SshLegRaw>>,
     relays: Option<Vec<RelayRaw>>,
+}
+
+/// Raw `logging:` block. Every key optional.
+#[derive(Debug, Default, Deserialize)]
+struct LogConfig {
+    /// Level name: error, warn, info, debug, trace, off (case-insensitive).
+    level: Option<String>,
+    /// False disables file logging entirely (stderr only).
+    file: Option<bool>,
+    /// Directory for rust-vmnet-proxy.log. Empty or absent means the
+    /// default ~/Library/Logs/rust-vmnet-proxy. Relative paths resolve
+    /// against $HOME.
+    dir: Option<String>,
+    /// Rotate when the file is older than this many seconds.
+    /// Default 86400 (daily). 0 disables time rotation.
+    rotate_secs: Option<u64>,
+    /// Rotated files kept. Default 3. 0 deletes the rotated file at once.
+    keep: Option<u32>,
+    /// Size cap in bytes that forces a rotation. Default 10 MiB.
+    /// 0 disables the size cap.
+    max_bytes: Option<u64>,
+}
+
+/// Resolved logging setup, what the binary does at startup.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Logging {
+    /// Level name (lowercased) or None to fall back to RUST_LOG/"info".
+    pub level: Option<String>,
+    /// False = no file logging, everything goes to stderr.
+    pub file: bool,
+    /// Directory for rust-vmnet-proxy.log, always absolute after load.
+    pub dir: PathBuf,
+    /// Seconds; 0 disables time rotation.
+    pub rotate_secs: u64,
+    /// Rotated files kept.
+    pub keep: u32,
+    /// Size cap in bytes; 0 disables.
+    pub max_bytes: u64,
+}
+
+impl Default for Logging {
+    fn default() -> Self {
+        Logging {
+            level: None,
+            file: true,
+            // placeholder: load_with joins it with $HOME
+            dir: PathBuf::new(),
+            rotate_secs: 86400,
+            keep: 3,
+            max_bytes: 10 * 1024 * 1024,
+        }
+    }
+}
+
+/// Empty dir -> ~/Library/Logs/rust-vmnet-proxy, relative dir -> against
+/// $HOME, absolute kept as-is. Dir is cleared when file logging is off.
+fn resolve_log_dir(mut l: Logging, home: &str) -> Logging {
+    if !l.file {
+        l.dir = PathBuf::new();
+        return l;
+    }
+    if l.dir.as_os_str().is_empty() {
+        l.dir = PathBuf::from(home).join("Library/Logs/rust-vmnet-proxy");
+    } else if l.dir.is_relative() {
+        let d = std::mem::take(&mut l.dir);
+        l.dir = PathBuf::from(home).join(d);
+    }
+    l
+}
+
+pub(crate) fn parse_level(s: &str) -> Result<log::LevelFilter, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "off" => Ok(log::LevelFilter::Off),
+        "error" => Ok(log::LevelFilter::Error),
+        "warn" => Ok(log::LevelFilter::Warn),
+        "info" => Ok(log::LevelFilter::Info),
+        "debug" => Ok(log::LevelFilter::Debug),
+        "trace" => Ok(log::LevelFilter::Trace),
+        other => Err(format!(
+            "bad logging level {other:?}, expected error, warn, info, debug, trace or off"
+        )),
+    }
+}
+
+impl Logging {
+    /// LevelFilter from config, then RUST_LOG's first segment, then info.
+    /// RUST_LOG beyond the first segment (module filters) is ignored here.
+    pub fn effective_level(&self) -> log::LevelFilter {
+        if let Some(l) = &self.level {
+            return parse_level(l).unwrap_or(log::LevelFilter::Info);
+        }
+        if let Ok(env) = std::env::var("RUST_LOG") {
+            let first = env.split(',').next().unwrap_or("");
+            // env_logger syntax allows "module=level" segments
+            let word = first.split('=').next_back().unwrap_or("");
+            if let Ok(f) = parse_level(word) {
+                return f;
+            }
+        }
+        log::LevelFilter::Info
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +259,7 @@ pub struct Config {
     pub socks_listen: SocketAddr,
     pub mac: Option<[u8; 6]>,
     pub power_mode: PowerMode,
+    pub logging: Logging,
     pub ssh_legs: Vec<SshLeg>,
     pub relays: Vec<Relay>,
     /// True when no config file was found and built-in defaults were used.
@@ -170,6 +273,7 @@ impl Default for Config {
             socks_listen: "127.0.0.1:1080".parse().unwrap(),
             mac: None,
             power_mode: PowerMode::default(),
+            logging: Logging::default(),
             ssh_legs: Vec::new(),
             relays: Vec::new(),
             from_defaults: false,
@@ -229,12 +333,13 @@ impl Config {
             None => match env_cfg {
                 Some(p) => p.into(),
                 None => {
-                    let default = PathBuf::from(home).join(".config/rust-vmnet-proxy/config.yaml");
+                    let default = PathBuf::from(home.clone()).join(".config/rust-vmnet-proxy/config.yaml");
                     if default.exists() {
                         default
                     } else {
                         return Ok(Config {
                             from_defaults: true,
+                            logging: resolve_log_dir(Logging::default(), &home),
                             ..Config::default()
                         });
                     }
@@ -259,6 +364,27 @@ impl Config {
             Some(s) => PowerMode::parse(s)?,
             None => def.power_mode,
         };
+        let logging = match raw.logging {
+            Some(l) => {
+                let level = match &l.level {
+                    Some(s) => {
+                        parse_level(s)?;
+                        Some(s.to_ascii_lowercase())
+                    }
+                    None => None,
+                };
+                Logging {
+                    level,
+                    file: l.file.unwrap_or(def.logging.file),
+                    dir: l.dir.map(PathBuf::from).unwrap_or_default(),
+                    rotate_secs: l.rotate_secs.unwrap_or(def.logging.rotate_secs),
+                    keep: l.keep.unwrap_or(def.logging.keep),
+                    max_bytes: l.max_bytes.unwrap_or(def.logging.max_bytes),
+                }
+            }
+            None => def.logging,
+        };
+        let logging = resolve_log_dir(logging, &home);
         let ssh_legs = match raw.ssh_legs {
             Some(legs) => {
                 let mut out = Vec::new();
@@ -339,6 +465,7 @@ impl Config {
             socks_listen,
             mac,
             power_mode,
+            logging,
             ssh_legs,
             relays,
             from_defaults: false,
@@ -871,5 +998,97 @@ mod tests {
         std::fs::remove_file(&lock).unwrap();
         // env var beats HOME default
         assert_eq!(c.socks_listen.to_string(), "127.0.0.1:8888");
+    }
+
+    #[test]
+    fn load_logging_block_happy() {
+        let p = write_cfg(
+            "logging:\n  level: Debug\n  dir: /tmp/rvp-logs-test\n  rotate_secs: 3600\n  keep: 5\n  max_bytes: 1048576\n",
+        );
+        let c = Config::load_with(Some(p.to_str().unwrap()), None, "/home/x".into()).unwrap();
+        assert_eq!(c.logging.level.as_deref(), Some("debug"));
+        assert!(c.logging.file);
+        assert_eq!(c.logging.dir, PathBuf::from("/tmp/rvp-logs-test"));
+        assert_eq!(c.logging.rotate_secs, 3600);
+        assert_eq!(c.logging.keep, 5);
+        assert_eq!(c.logging.max_bytes, 1048576);
+    }
+
+    #[test]
+    fn load_logging_defaults() {
+        let p = write_cfg("socks_listen: 127.0.0.1:1234\n");
+        let c = Config::load_with(Some(p.to_str().unwrap()), None, "/home/y".into()).unwrap();
+        assert_eq!(c.logging.level, None);
+        assert!(c.logging.file);
+        assert_eq!(
+            c.logging.dir,
+            PathBuf::from("/home/y/Library/Logs/rust-vmnet-proxy")
+        );
+        assert_eq!(c.logging.rotate_secs, 86400);
+        assert_eq!(c.logging.keep, 3);
+        assert_eq!(c.logging.max_bytes, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn load_logging_relative_dir_resolves_against_home() {
+        let p = write_cfg("logging:\n  dir: Logs/proxy\n");
+        let c = Config::load_with(Some(p.to_str().unwrap()), None, "/home/z".into()).unwrap();
+        assert_eq!(c.logging.dir, PathBuf::from("/home/z/Logs/proxy"));
+    }
+
+    #[test]
+    fn load_logging_file_false_disables() {
+        let p = write_cfg("logging:\n  file: false\n  dir: /tmp/ignored\n");
+        let c = Config::load_with(Some(p.to_str().unwrap()), None, "/home/w".into()).unwrap();
+        assert!(!c.logging.file);
+        assert!(c.logging.dir.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn load_logging_bad_level_rejected() {
+        let p = write_cfg("logging:\n  level: verbose\n");
+        assert!(
+            Config::load_with(Some(p.to_str().unwrap()), None, "/home/v".into())
+                .unwrap_err()
+                .contains("bad logging level")
+        );
+    }
+
+    #[test]
+    fn load_logging_off_level_kept() {
+        let p = write_cfg("logging:\n  level: OFF\n");
+        let c = Config::load_with(Some(p.to_str().unwrap()), None, "/home/u".into()).unwrap();
+        assert_eq!(c.logging.level.as_deref(), Some("off"));
+        assert_eq!(c.logging.effective_level(), log::LevelFilter::Off);
+    }
+
+    #[test]
+    fn effective_level_falls_back_to_info() {
+        let l = Logging::default();
+        // RUST_LOG may be set by the harness; the fallthrough target is info
+        let lv = l.effective_level();
+        assert!(matches!(
+            lv,
+            log::LevelFilter::Info | log::LevelFilter::Debug | log::LevelFilter::Trace
+        ));
+    }
+
+    #[test]
+    fn effective_level_config_beats_env() {
+        let l = Logging {
+            level: Some("error".into()),
+            ..Logging::default()
+        };
+        assert_eq!(l.effective_level(), log::LevelFilter::Error);
+    }
+
+    #[test]
+    fn load_no_config_logging_dir_resolved() {
+        let c = Config::load_with(None, None, "/home/t".into()).unwrap();
+        assert!(c.from_defaults);
+        assert_eq!(
+            c.logging.dir,
+            PathBuf::from("/home/t/Library/Logs/rust-vmnet-proxy")
+        );
     }
 }

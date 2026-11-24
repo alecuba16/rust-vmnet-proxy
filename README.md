@@ -133,7 +133,10 @@ Options:
 | `restart-mac` | Restart the LaunchAgent. |
 
 The LaunchAgent runs the binary with `--config ~/.config/rust-vmnet-proxy/config.yaml`,
-starts at login, restarts on failure, logs to `~/Library/Logs/rust-vmnet-proxy/`.
+starts at login, restarts on failure. Logs are written by the binary itself
+to `~/Library/Logs/rust-vmnet-proxy/rust-vmnet-proxy.log`, rotated by age
+and size (see the `logging:` config block); the agent's stderr file only
+collects panics and pre-init failures.
 
 ## Security notes
 

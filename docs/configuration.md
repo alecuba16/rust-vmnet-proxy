@@ -152,6 +152,28 @@ shutdown latency, never throughput.
 `battery` is the default: idle cost is the DHCP timer and nothing else.
 `performance` trades wakeups for snappier connect and shutdown latency.
 
+## Logging
+
+The binary owns its log files; no external rotation daemon is needed.
+Logs go to `~/Library/Logs/rust-vmnet-proxy/rust-vmnet-proxy.log` by
+default (macOS convention for user agents), with `.1`, `.2`, ... rotated
+copies kept beside it. Under launchd, stderr is pointed at
+`stderr.log` in the same directory and receives only panics and
+pre-logger-init failures.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `logging.level` | string | RUST_LOG, else `info` | error, warn, info, debug, trace, off. Case-insensitive. |
+| `logging.file` | bool | `true` | `false` turns the file logger off entirely: log lines go to stderr only. |
+| `logging.dir` | path | `~/Library/Logs/rust-vmnet-proxy` | Log directory, created when missing. Relative paths resolve against `$HOME`. |
+| `logging.rotate_secs` | u64 | `86400` | Rotate when the current file is older than this many seconds. `0` disables time-based rotation. |
+| `logging.keep` | u32 | `3` | Rotated files kept. `0` deletes the previous file at rotation instead of renaming it. |
+| `logging.max_bytes` | u64 | `10485760` | Rotate once the current file reaches this size. `0` disables the size cap. |
+
+Rotation age anchors on the file's mtime, so restarts don't reset the
+clock on a long-lived log. A `level` value in config always wins over
+`RUST_LOG`.
+
 ## Formats
 
 - SocketAddr: `ip:port`, IPv4 or IPv6, same as Rust's `SocketAddr`

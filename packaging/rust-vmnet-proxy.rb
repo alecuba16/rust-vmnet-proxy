@@ -41,8 +41,10 @@ class RustVmnetProxy < Formula
   service do
     run [opt_bin/"rust-vmnet-proxy", "--config", "#{Dir.home}/.config/rust-vmnet-proxy/config.yaml"]
     keep_alive true
-    log_path "#{Dir.home}/Library/Logs/rust-vmnet-proxy/rust-vmnet-proxy.log"
-    error_log_path "#{Dir.home}/Library/Logs/rust-vmnet-proxy/rust-vmnet-proxy.log"
+    # the binary writes its own rotated rust-vmnet-proxy.log; launchd stderr
+    # only needs panics and pre-init failures, keep it out of the main log
+    log_path "#{Dir.home}/Library/Logs/rust-vmnet-proxy/stderr.log"
+    error_log_path "#{Dir.home}/Library/Logs/rust-vmnet-proxy/stderr.log"
     environment_variables RUST_LOG: "info"
     process_type :background
   end

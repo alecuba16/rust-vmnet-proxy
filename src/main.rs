@@ -1,6 +1,7 @@
 mod cmds;
 mod config;
 mod legchain;
+mod logging;
 mod netloop;
 mod pipe;
 mod service;
@@ -154,8 +155,9 @@ fn main() {
         _ => {}
     }
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
+    // Config loads before the logger: the logging block decides where logs
+    // go. Until init runs, log macros are no-ops; failures here print to
+    // stderr raw, which launchd still captures.
     let config_path = parse_config_flag();
     let cfg = match config::Config::load(config_path.as_deref()) {
         Ok(c) => c,
@@ -164,6 +166,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    logging::init(&cfg.logging);
 
     install_signal_handlers();
 

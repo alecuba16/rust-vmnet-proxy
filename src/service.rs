@@ -92,7 +92,7 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
-fn plist_xml(bin: &str, config_path: &str, log_file: &str) -> String {
+fn plist_xml(bin: &str, config_path: &str, stderr_file: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -119,9 +119,9 @@ fn plist_xml(bin: &str, config_path: &str, log_file: &str) -> String {
         <string>info</string>
     </dict>
     <key>StandardOutPath</key>
-    <string>{log_file}</string>
+    <string>{stderr_file}</string>
     <key>StandardErrorPath</key>
-    <string>{log_file}</string>
+    <string>{stderr_file}</string>
     <key>ProcessType</key>
     <string>Background</string>
 </dict>
@@ -200,11 +200,13 @@ fn write_agent(verb: &str) -> io::Result<()> {
     }
 
     let config_path = home().join(".config/rust-vmnet-proxy/config.yaml");
-    let log_file = log_dir().join("rust-vmnet-proxy.log");
+    // launchd stderr keeps only panics and pre-init failures: the app-owned
+    // rust-vmnet-proxy.log (rotated by the binary) carries the real log.
+    let stderr_file = log_dir().join("stderr.log");
     let xml = plist_xml(
         &xml_escape(&bin.display().to_string()),
         &xml_escape(&config_path.display().to_string()),
-        &xml_escape(&log_file.display().to_string()),
+        &xml_escape(&stderr_file.display().to_string()),
     );
     println!("{verb}: writing plist {}", plist.display());
     fs::write(&plist, xml)?;
