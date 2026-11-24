@@ -1,0 +1,156 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    name: Build macOS ${{ matrix.target }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            artifact: rust-vmnet-proxy-macos-aarch64
+          - target: x86_64-apple-darwin
+            artifact: rust-vmnet-proxy-macos-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Validate SemVer tag
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag must be vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --target-dir target
+
+      - name: Build release
+        run: cargo build --release --target-dir target --target ${{ matrix.target }}
+
+      - name: Verify release version
+        run: |
+          actual="$(target/${{ matrix.target }}/release/rust-vmnet-proxy --version)"
+          echo "version=$actual"
+          test "$actual" = "rust-vmnet-proxy ${GITHUB_REF_NAME#v}"
+
+      - name: Package
+        run: |
+          mkdir -p dist/${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/rust-vmnet-proxy dist/${{ matrix.artifact }}/rust-vmnet-proxy
+          chmod 755 dist/${{ matrix.artifact }}/rust-vmnet-proxy
+          cat > dist/${{ matrix.artifact }}/README.txt <<'EOF'
+          Install (copies to ~/.local/bin and registers the LaunchAgent):
+            ./rust-vmnet-proxy install-mac
+
+          Update existing install:
+            ./rust-vmnet-proxy update-mac
+
+          Uninstall:
+            ./rust-vmnet-proxy uninstall-mac
+
+          Config: ~/.config/rust-vmnet-proxy/config.yaml
+          Example: example/config.example.yaml in the repository.
+          EOF
+          tar -C dist -czf dist/${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+          shasum -a 256 dist/${{ matrix.artifact }}.tar.gz > dist/${{ matrix.artifact }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.artifact }}.tar.gz
+            dist/${{ matrix.artifact }}.tar.gz.sha256
+
+  release:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    needs: build-macos
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: rust-vmnet-proxy ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  publish-tap:
+    name: Update Homebrew tap
+    runs-on: ubuntu-latest
+    needs: release
+    # Reuses the tap's own generator so the formula here and the formula the
+    # tap regenerates manually can never drift apart. Same pattern as
+    # herdr-webui.
+    steps:
+      - name: Check tap token
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN is not set in repo secrets. The formula push to the tap is skipped until the secret is added (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+          code="$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer $HOMEBREW_TAP_TOKEN" \
+              https://api.github.com/repos/alecuba16/homebrew-tap)"
+          if [ "$code" != "200" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN was rejected (HTTP $code, expired or missing tap access). Rotate it: Settings > Secrets and variables > Actions > HOMEBREW_TAP_TOKEN."
+            exit 1
+          fi
+          echo "tap token accepted"
+
+      - name: Checkout tap
+        uses: actions/checkout@v7
+        with:
+          repository: alecuba16/homebrew-tap
+          # Fine-grained PAT, contents:write on alecuba16/homebrew-tap only.
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Regenerate formula for ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          chmod +x scripts/generate_rust-vmnet-proxy_formula.sh
+          # Explicit tag: no latest-release race with the just-published one.
+          ./scripts/generate_rust-vmnet-proxy_formula.sh Formula/rust-vmnet-proxy.rb "${GITHUB_REF_NAME}"
+          ruby -c Formula/rust-vmnet-proxy.rb
+
+      - name: Commit formula bump
+        run: |
+          git config user.name "alecuba16"
+          git config user.email "alecuba16@gmail.com"
+          if git diff --quiet; then
+            echo "formula already current, nothing to push"
+          else
+            git add Formula/rust-vmnet-proxy.rb
+            git commit -m "bump rust-vmnet-proxy to ${GITHUB_REF_NAME}"
+            git push
+          fi

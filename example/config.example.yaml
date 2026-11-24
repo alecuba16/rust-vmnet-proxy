@@ -1,0 +1,75 @@
+# rust-vmnet-proxy example configuration.
+# Copy to ~/.config/rust-vmnet-proxy/config.yaml and edit.
+# Every key is optional: unset keys fall back to built-in defaults.
+# Before the proxy can run, the vmnet socket must exist:
+# `rust-vmnet-proxy setup-vmnet` (one-time, needs sudo; Lima users
+# already have the socket, setup is a no-op). See docs/configuration.md.
+
+# Unix socket of the root socket_vmnet daemon (bridged mode). The proxy
+# speaks Ethernet frames over this socket, no root needed.
+# Default: /private/var/run/lima/socket_vmnet.bridged
+vmnet_socket: /private/var/run/lima/socket_vmnet.bridged
+
+# Local SOCKS5 listener (direct leg, egress via the vmnet bridge).
+# Default: 127.0.0.1:1080
+socks_listen: 127.0.0.1:1080
+
+# Source MAC address, format aa:bb:cc:dd:ee:ff. Used as given, no bits are
+# enforced. When absent, one is derived deterministically from a hash of
+# the socket path (locally administered 02:xx:xx:xx:xx:xx) so reboots don't
+# churn the bridge's forwarding table.
+# mac: "02:1a:2b:3c:4d:5e"
+
+# Idle wakeup tuning. Data paths are event-driven either way.
+#   battery:     netloop sleeps until smoltcp timers need it, longer accept
+#                and splice polls (best for laptops)
+#   performance: short fixed poll caps, snappiest shutdown and latency
+# Default: battery
+power_mode: battery
+
+# Supervised ssh legs, plain `ssh -N` subprocesses over the Mac's normal
+# stack. Hosts resolve via ~/.ssh/config aliases (hostname, port, user,
+# keys all come from there). Host key checking stays strict; pin keys with
+# ssh-keyscan into known_hosts if needed. Each leg restarts with backoff
+# if the ssh process dies, and the forward port is verified before the leg
+# is declared up. Omit ssh_legs entirely for direct SOCKS5 only.
+ssh_legs:
+  # Dynamic SOCKS5 forward: ssh -N -D 127.0.0.1:1081 bastion-a
+  # source: masquerade is the default. ssh binds 127.0.0.1:1081 directly,
+  # rust-vmnet-proxy is not in the data path, traffic appears to come from the
+  # bastion itself.
+  - listen: 1081
+    host: bastion-a
+    mode: dynamic
+    source: masquerade
+
+  # Chained leg with source identification. ssh -D binds a private upstream
+  # port (default: listen + 30000, here 31082) and rust-vmnet-proxy owns the
+  # public listener on bind:listen (default 127.0.0.1). Each connection
+  # gets a PROXY protocol v1 header so PROXY-protocol-aware receivers
+  # (e.g. HAProxy/Traefik with proxy_protocol on) can log the real client
+  # IP. The service behind the proxy must understand PROXY protocol v1;
+  # masquerade (default) works with anything.
+  - listen: 1082
+    host: bastion-b
+    mode: dynamic
+    source: identify
+    bind: 0.0.0.0
+    upstream: 31082
+    # HTTP/1.x header injection into the FIRST request of each connection
+    # (identify legs only). TLS is unreadable and HTTP/2 prior-knowledge
+    # (PRI) is not modified, so bytes pass through untouched there. Keep-alive
+    # connections only get headers on the first request. Block absent = no
+    # injection at all; present = all five headers default on.
+    http_headers:
+      x_forwarded_for: true     # chain-append client IP to any existing value
+      x_real_ip: true           # client IP, only if absent
+      x_forwarded_host: true   # copy of Host header, only if Host present and absent
+      x_forwarded_proto: true   # "http" (client spoke plaintext), only if absent
+      forwarded: true          # RFC 7239 for=/host=/proto=, only if absent
+
+  # Local port forward: ssh -N -L 127.0.0.1:1086:10.0.0.5:3000 jump-host-c
+  - listen: 1086
+    host: jump-host-c
+    mode: local_forward
+    forward: 10.0.0.5:3000

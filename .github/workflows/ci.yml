@@ -1,0 +1,48 @@
+name: rust-vmnet-proxy CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --target-dir target --all-targets -- -D warnings
+
+      - name: Check
+        run: cargo check --target-dir target
+
+      - name: Test
+        run: cargo test --target-dir target
+
+      - name: Build release
+        run: cargo build --release --target-dir target
+
+      - name: Version matches Cargo.toml
+        run: |
+          expected="rust-vmnet-proxy $(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          version="$(target/release/rust-vmnet-proxy --version)"
+          echo "version=$version"
+          test "$version" = "$expected"
