@@ -5,6 +5,7 @@ use std::os::unix::net::UnixStream;
 
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
+use smoltcp::wire::Ipv4Address;
 
 const FRAME_MAX: usize = 65535;
 
@@ -31,6 +32,28 @@ pub struct VmnetDevice {
     /// multicast (ARP, mDNS) while the router stops forwarding our unicast,
     /// so the watchdog needs a unicast-only signal.
     rx_unicast: u64,
+    /// Unicast ARP REPLY frames for our MAC only. The gateway answering our
+    /// own neighbor discovery is solicited traffic: it proves the unicast
+    /// path but says nothing about client demand. The heartbeat pays its
+    /// debt from this counter.
+    rx_arp_reply: u64,
+    /// Unicast frames for our MAC that are not ARP replies: client traffic,
+    /// the DHCP exchange, DNS answers, anything a peer sent us on purpose.
+    /// Only this counter ends heartbeat phases.
+    rx_unicast_data: u64,
+    /// ARP REQUEST frames transmitted since boot for the ARP target
+    /// (the gateway): questions to other LAN peers are not gateway
+    /// evidence. Each gateway question has a matching reply on a healthy
+    /// path. The heartbeat samples this around poll and accrues its debt
+    /// from the delta.
+    tx_arp_req: u64,
+    /// The only neighbor whose ARP questions count as heartbeat debt.
+    /// Debt exists to make the heartbeat's visibility WARN honest: N
+    /// unanswered questions to THE GATEWAY mean the gateway is silent.
+    /// Questions to other LAN peers (a dead ilo, say) say nothing about
+    /// the gateway and must not ring its alarm. None until the first
+    /// lease; the netloop sets it via refresh_gateway on every lease.
+    arp_target: Option<Ipv4Address>,
 }
 
 pub struct PhysRxToken {
@@ -39,6 +62,8 @@ pub struct PhysRxToken {
 
 pub struct PhysTxToken<'a> {
     frames: &'a mut VecDeque<Vec<u8>>,
+    arp_reqs: &'a mut u64,
+    arp_target: Option<Ipv4Address>,
 }
 
 impl RxToken for PhysRxToken {
@@ -57,6 +82,23 @@ impl TxToken for PhysTxToken<'_> {
     {
         let mut frame = vec![0u8; len];
         let result = f(&mut frame);
+        // ARP REQUEST on the wire (ethertype 0x0806, opcode 1 at frame
+        // offsets 20..22, target protocol address at 38..42, full frame
+        // 14+28 bytes), asked about the gateway. The heartbeat's debt
+        // ledger accrues from this counter: a probe fire whose neighbor
+        // entry is still valid sends a blind UDP:9 the gateway discards,
+        // asks no question, and must not accrue debt, or a healthy idle
+        // LAN WARNs on every other fire while the neighbor TTL and the
+        // heartbeat knob coincide.
+        if frame.len() >= 42
+            && frame[12..14] == [0x08, 0x06]
+            && frame[20..22] == [0x00, 0x01]
+            && self
+                .arp_target
+                .is_some_and(|t| frame[38..42] == t.octets()[..])
+        {
+            *self.arp_reqs += 1;
+        }
         self.frames.push_back(frame);
         result
     }
@@ -65,6 +107,12 @@ impl TxToken for PhysTxToken<'_> {
 impl VmnetDevice {
     pub fn connect(socket_path: &str, local_mac: [u8; 6]) -> std::io::Result<Self> {
         let stream = UnixStream::connect(socket_path)?;
+        Self::from_stream(stream, local_mac)
+    }
+
+    /// Build a device on an already-connected stream. Production goes
+    /// through [`Self::connect`]; tests build socketpairs.
+    pub fn from_stream(stream: UnixStream, local_mac: [u8; 6]) -> std::io::Result<Self> {
         stream.set_nonblocking(true)?;
         Ok(Self {
             stream,
@@ -76,6 +124,10 @@ impl VmnetDevice {
             local_mac,
             rx_taken: 0,
             rx_unicast: 0,
+            rx_arp_reply: 0,
+            rx_unicast_data: 0,
+            tx_arp_req: 0,
+            arp_target: None,
         })
     }
 
@@ -96,6 +148,32 @@ impl VmnetDevice {
     /// Unicast frames for our MAC since boot, after the MAC filter.
     pub fn rx_unicast(&self) -> u64 {
         self.rx_unicast
+    }
+
+    /// Unicast ARP REPLY frames for our MAC since boot. Solicited answers,
+    /// most importantly the gateway's reply to the heartbeat's own ARP.
+    pub fn rx_arp_reply(&self) -> u64 {
+        self.rx_arp_reply
+    }
+
+    /// Unicast frames for our MAC that are not ARP replies, since boot.
+    /// Genuine peer-to-us traffic.
+    pub fn rx_unicast_data(&self) -> u64 {
+        self.rx_unicast_data
+    }
+
+    /// ARP REQUEST frames transmitted since boot for the target set by
+    /// [`Self::set_arp_target`]. The heartbeat's debt accrues from
+    /// per-pass deltas of this counter.
+    pub fn tx_arp_req(&self) -> u64 {
+        self.tx_arp_req
+    }
+
+    /// The neighbor whose ARP questions count as heartbeat debt: the
+    /// gateway. Called from refresh_gateway on every lease, including
+    /// renewals that keep the same address.
+    pub fn set_arp_target(&mut self, target: Ipv4Address) {
+        self.arp_target = Some(target);
     }
 
     /// Pull every complete frame currently readable from the daemon socket.
@@ -229,11 +307,32 @@ impl Device for VmnetDevice {
             }
             if dst == self.local_mac {
                 self.rx_unicast += 1;
+                // ARP and data unicast tell different stories. An ARP REPLY
+                // to our MAC proves the bridge still forwards unicast to us,
+                // but the gateway replying to our own ARP request is an
+                // answer we solicited, not client traffic. The heartbeat
+                // must not read it as demand: every fire with an expired
+                // neighbor entry re-ARPs, the reply lands as a fresh
+                // unicast refresh, and treating it as traffic pins the
+                // heartbeat back to unicast_silence cadence (observed live:
+                // ~1.9 fires/min, phases dying at their first fire with no
+                // WARN). Count replies apart so the heartbeat can pay its
+                // debt without ending its phase.
+                if frame.len() >= 42
+                    && frame[12..14] == [0x08, 0x06]
+                    && frame[20..22] == [0x00, 0x02]
+                {
+                    self.rx_arp_reply += 1;
+                } else {
+                    self.rx_unicast_data += 1;
+                }
             }
             self.rx_taken += 1;
             let rx = PhysRxToken { frame };
             let tx = PhysTxToken {
                 frames: &mut self.tx_frames,
+                arp_reqs: &mut self.tx_arp_req,
+                arp_target: self.arp_target,
             };
             return Some((rx, tx));
         }
@@ -243,6 +342,8 @@ impl Device for VmnetDevice {
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(PhysTxToken {
             frames: &mut self.tx_frames,
+            arp_reqs: &mut self.tx_arp_req,
+            arp_target: self.arp_target,
         })
     }
 
@@ -251,5 +352,181 @@ impl Device for VmnetDevice {
         caps.medium = Medium::Ethernet;
         caps.max_transmission_unit = 1500;
         caps
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LOCAL_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x12, 0x34, 0x56];
+
+    fn test_dev() -> (VmnetDevice, UnixStream) {
+        let (peer, ours) = UnixStream::pair().unwrap();
+        let dev = VmnetDevice::from_stream(ours, LOCAL_MAC).unwrap();
+        (dev, peer)
+    }
+
+    fn eth_frame(ethertype: [u8; 2], payload: &[u8]) -> Vec<u8> {
+        let mut f = Vec::with_capacity(14 + payload.len());
+        f.extend_from_slice(&LOCAL_MAC); // dst: us, unicast
+        f.extend_from_slice(&[0xc8, 0x33, 0xe5, 0x8e, 0xcc, 0x8c]); // src: gateway
+        f.extend_from_slice(&ethertype);
+        f.extend_from_slice(payload);
+        f
+    }
+
+    fn arp_payload(opcode: u16, tpa: [u8; 4]) -> Vec<u8> {
+        let mut p = Vec::with_capacity(28);
+        p.extend_from_slice(&[0x00, 0x01]); // hardware type: ethernet
+        p.extend_from_slice(&[0x08, 0x00]); // protocol type: IPv4
+        p.push(6); // hardware addr len
+        p.push(4); // protocol addr len
+        p.extend_from_slice(&opcode.to_be_bytes());
+        p.extend_from_slice(&[0x11; 6]); // sender hardware addr
+        p.extend_from_slice(&[192, 168, 1, 1]); // sender protocol addr
+        p.extend_from_slice(&[0x00; 6]); // target hardware addr
+        p.extend_from_slice(&tpa);
+        p
+    }
+
+    fn feed(dev: &mut VmnetDevice, peer: &mut UnixStream, frame: &[u8]) {
+        peer.write_all(&(frame.len() as u32).to_be_bytes()).unwrap();
+        peer.write_all(frame).unwrap();
+        dev.fill_rx().unwrap();
+    }
+
+    fn drain_rx(dev: &mut VmnetDevice) {
+        while let Some((_rx, _tx)) = dev.receive(Instant::now()) {}
+    }
+
+    #[test]
+    fn tx_arp_request_to_target_counts() {
+        let (mut dev, _peer) = test_dev();
+        dev.set_arp_target(Ipv4Address::new(192, 168, 1, 1));
+        let frame = eth_frame([0x08, 0x06], &arp_payload(1, [192, 168, 1, 1]));
+        let token = dev.transmit(Instant::now()).expect("tx token");
+        token.consume(frame.len(), |buf| buf.copy_from_slice(&frame));
+        assert_eq!(dev.tx_arp_req(), 1);
+    }
+
+    #[test]
+    fn tx_arp_request_to_other_ip_is_not_gateway_evidence() {
+        // Questions to other LAN peers (ilo, say) must not accrue gateway
+        // debt: a dead ilo answering nothing must never WARN "gateway
+        // silent".
+        let (mut dev, _peer) = test_dev();
+        dev.set_arp_target(Ipv4Address::new(192, 168, 1, 1));
+        let frame = eth_frame([0x08, 0x06], &arp_payload(1, [192, 168, 1, 50]));
+        let token = dev.transmit(Instant::now()).expect("tx token");
+        token.consume(frame.len(), |buf| buf.copy_from_slice(&frame));
+        assert_eq!(dev.tx_arp_req(), 0);
+    }
+
+    #[test]
+    fn tx_arp_request_without_target_set_is_ignored() {
+        // No lease yet: no gateway, no question worth counting.
+        let (mut dev, _peer) = test_dev();
+        let frame = eth_frame([0x08, 0x06], &arp_payload(1, [192, 168, 1, 1]));
+        let token = dev.transmit(Instant::now()).expect("tx token");
+        token.consume(frame.len(), |buf| buf.copy_from_slice(&frame));
+        assert_eq!(dev.tx_arp_req(), 0);
+    }
+
+    #[test]
+    fn tx_arp_reply_is_not_a_question() {
+        let (mut dev, _peer) = test_dev();
+        dev.set_arp_target(Ipv4Address::new(192, 168, 1, 1));
+        let frame = eth_frame([0x08, 0x06], &arp_payload(2, [192, 168, 1, 1]));
+        let token = dev.transmit(Instant::now()).expect("tx token");
+        token.consume(frame.len(), |buf| buf.copy_from_slice(&frame));
+        assert_eq!(dev.tx_arp_req(), 0);
+    }
+
+    #[test]
+    fn tx_truncated_arp_like_frame_is_safe() {
+        // A frame under 42 bytes never reaches the opcode or target reads;
+        // blind writes and malformed daemons must not panic the netloop.
+        let (mut dev, _peer) = test_dev();
+        dev.set_arp_target(Ipv4Address::new(192, 168, 1, 1));
+        let token = dev.transmit(Instant::now()).expect("tx token");
+        token.consume(20, |buf| {
+            buf[..6].copy_from_slice(&LOCAL_MAC);
+            buf[6..12].copy_from_slice(&[0x11; 6]);
+            buf[12..14].copy_from_slice(&[0x08, 0x06]);
+        });
+        assert_eq!(dev.tx_arp_req(), 0);
+    }
+
+    #[test]
+    fn rx_unicast_arp_reply_classifies_as_reply_not_data() {
+        let (mut dev, mut peer) = test_dev();
+        let frame = eth_frame([0x08, 0x06], &arp_payload(2, [192, 168, 1, 4]));
+        feed(&mut dev, &mut peer, &frame);
+        drain_rx(&mut dev);
+        assert_eq!(dev.rx_taken(), 1);
+        assert_eq!(dev.rx_unicast(), 1);
+        assert_eq!(dev.rx_arp_reply(), 1);
+        assert_eq!(
+            dev.rx_unicast_data(),
+            0,
+            "the gateway's own reply is not demand"
+        );
+    }
+
+    #[test]
+    fn rx_unicast_data_classifies_as_data() {
+        let (mut dev, mut peer) = test_dev();
+        // 42-byte IPv4 frame: same length as an ARP reply, different story.
+        let frame = eth_frame([0x08, 0x00], &[0x45; 28]);
+        feed(&mut dev, &mut peer, &frame);
+        drain_rx(&mut dev);
+        assert_eq!(dev.rx_unicast_data(), 1);
+        assert_eq!(dev.rx_arp_reply(), 0);
+    }
+
+    #[test]
+    fn rx_truncated_arp_ethertype_frame_is_data_and_safe() {
+        // A unicast frame under 42 bytes carrying the ARP ethertype must
+        // classify as data, not panic on the opcode read. (The guard order
+        // bug this pins: len must come before opcode.)
+        let (mut dev, mut peer) = test_dev();
+        let frame = eth_frame([0x08, 0x06], &[0x00; 6]); // 20 bytes total
+        feed(&mut dev, &mut peer, &frame);
+        drain_rx(&mut dev);
+        assert_eq!(dev.rx_unicast_data(), 1);
+        assert_eq!(dev.rx_arp_reply(), 0);
+    }
+
+    #[test]
+    fn rx_broadcast_arp_request_is_not_unicast() {
+        // Other peers' discovery traffic floods the bridge; it says
+        // nothing about OUR unicast path.
+        let (mut dev, mut peer) = test_dev();
+        let mut frame = eth_frame([0x08, 0x06], &arp_payload(1, [192, 168, 1, 4]));
+        frame[..6].copy_from_slice(&[0xff; 6]); // broadcast dst
+        feed(&mut dev, &mut peer, &frame);
+        drain_rx(&mut dev);
+        assert_eq!(dev.rx_unicast(), 0);
+        assert_eq!(dev.rx_arp_reply(), 0);
+        assert_eq!(dev.rx_unicast_data(), 0);
+        assert_eq!(dev.rx_taken(), 1, "smoltcp still sees it");
+    }
+
+    #[test]
+    fn rx_unicast_for_other_member_is_dropped() {
+        // The daemon floods every client's frames: a frame addressed to
+        // another VM must never touch our counters or smoltcp.
+        let (mut dev, mut peer) = test_dev();
+        let mut frame = eth_frame([0x08, 0x00], &[0x45; 28]);
+        frame[..6].copy_from_slice(&[0x02, 0x00, 0x00, 0xaa, 0xbb, 0xcc]); // foreign unicast, even first byte
+        feed(&mut dev, &mut peer, &frame);
+        assert_eq!(dev.fill_rx().unwrap(), 1, "frame queued from the wire");
+        assert!(
+            dev.receive(Instant::now()).is_none(),
+            "filtered before smoltcp"
+        );
+        assert_eq!(dev.rx_taken(), 0);
+        assert_eq!(dev.rx_unicast(), 0);
     }
 }

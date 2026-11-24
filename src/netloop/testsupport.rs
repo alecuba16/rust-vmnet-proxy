@@ -65,6 +65,10 @@ pub fn test_state(online: bool) -> NetState<'static> {
         last_heartbeat: None,
         heartbeat_unanswered: 0,
         heartbeat_reply_rx: None,
+        last_data_rx: SmolInstant::now(),
+        data_rx_last_seen: 0,
+        arp_reply_seen: false,
+        tx_arp_req_seen: 0,
         watchdog: WatchdogThresholds::default(),
         tx_stall: SmolDuration::from_secs(30),
     }

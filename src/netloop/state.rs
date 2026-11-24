@@ -121,9 +121,10 @@ pub struct NetState<'a> {
     /// Set once any inbound frame arrives; a LAN that is silent even while
     /// healthy would keep the watchdog permanently armed, so it disarms.
     pub ever_rx: bool,
-    /// Smoltcp Instant of the last unicast frame for our MAC. Bridged-mode
-    /// wedges can pass multicast while unicast forwarding is dead, so the
-    /// watchdog tracks unicast silence separately from total silence.
+    /// Unicast frames for our MAC since boot. Bridged-mode wedges can pass
+    /// multicast while the router stops forwarding our unicast, so the
+    /// watchdog needs a unicast-only signal. Includes ARP replies: they
+    /// prove the unicast forwarding path.
     pub last_unicast_rx: SmolInstant,
     /// Set once any unicast frame arrives; the unicast arm of the watchdog
     /// needs a healthy-unicast baseline before it can declare a wedge.
@@ -146,24 +147,43 @@ pub struct NetState<'a> {
     /// removes it. Separate from probe_socket so disarm() cannot drop a
     /// queued heartbeat packet mid-pass (the 0.2.6 probe storm).
     pub heartbeat_socket: Option<SocketHandle>,
-    /// When the heartbeat last probed the gateway. Cleared while unicast
-    /// flows so the first heartbeat of an idle gap fires at the arm
+    /// When the heartbeat last probed the gateway. Cleared while data
+    /// unicast flows so the first heartbeat of an idle gap fires at the arm
     /// threshold, not a full interval later.
     pub last_heartbeat: Option<SmolInstant>,
-    /// Heartbeats sent since the last one got an answer (ARP reply seen).
-    /// Above 1 the gateway is not answering our idle probes: keep probing
-    /// but make the half wedge visible in the log.
+    /// Heartbeat probes sent since the last one got an ARP REPLY. Above 1
+    /// the gateway is not answering our idle probes: keep probing but make
+    /// the half wedge visible in the log.
     pub heartbeat_unanswered: u32,
-    /// Snapshot of `last_unicast_rx` as of the unicast refresh that was
-    /// classified as a probe reply (debt paid). The netloop refreshes
-    /// `last_unicast_rx` once per frame, but heartbeat() runs every pass, so
-    /// the SAME refresh is presented repeatedly until the next frame: a bare
+    /// Data-unicast refresh instant of the frame that was classified as a
+    /// probe reply (debt paid). The netloop refreshes `last_unicast_rx` once
+    /// per frame, but heartbeat() runs every pass, so the SAME refresh is
+    /// presented repeatedly until the next frame: a bare
     /// `unanswered == 0` check would classify the re-presented refresh as
     /// genuine traffic and end the phase one pass after paying the debt (the
     /// 0.2.8 live 20s cadence: fire, reply pays debt, next pass kills phase,
-    /// recross fires fresh 20s later). The phase only ends on a refresh NEWER
-    /// than the classified one.
+    /// recross fires fresh 20s later). The phase only ends on a data refresh
+    /// NEWER than the classified one.
     pub heartbeat_reply_rx: Option<SmolInstant>,
+    /// Data-unicast refresh instant of the last frame our MAC received that
+    /// was not an ARP reply: client traffic, DHCP, DNS answers. The
+    /// heartbeat ends its phase only when this moves past the debt snapshot.
+    pub last_data_rx: SmolInstant,
+    /// Snapshot of `dev.rx_unicast_data()` as of the last pass that saw a
+    /// data frame advance. Compare against the device counter to detect a
+    /// new data frame without resetting `last_data_rx` on every pass.
+    pub data_rx_last_seen: u64,
+    /// ARP questions that actually hit the wire, as seen by the counters
+    /// block last pass. The heartbeat's debt accrues from the per-pass
+    /// delta of the device's TX counter against this value. Blind fires
+    /// (valid neighbor entry, UDP:9 discarded by the gateway) ask nothing
+    /// and accrue nothing.
+    pub tx_arp_req_seen: u64,
+    /// Per-pass flag sampled around poll in the netloop: true when an ARP
+    /// REPLY landed for our MAC in this pass's poll. heartbeat() runs after
+    /// the sampling block in the same pass, so a reply landing in this poll
+    /// is visible to the debt check. Cleared before poll each pass.
+    pub arp_reply_seen: bool,
     /// Timing knobs for the rx watchdog.
     pub watchdog: WatchdogThresholds,
     /// How long a full tx path may hold undrained spill before the conn is
