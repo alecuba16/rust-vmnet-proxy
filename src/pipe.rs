@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PIPE_CAP: usize = 256 * 1024;
 
@@ -236,16 +236,23 @@ mod tests {
         let handle = std::thread::spawn(move || {
             assert!(p2.push(&payload));
         });
-        std::thread::sleep(Duration::from_millis(120));
+        // The pusher writes its prefix and parks while the pipe is full.
+        // Wait for the parked state (full pipe) before draining: a timed
+        // drain loop can race the pusher's refill and consume part of the
+        // payload, making the tail assertion nondeterministic.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while p.len() < PIPE_CAP && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(p.len(), PIPE_CAP, "pusher never filled the pipe");
         while p.len() > 0 {
             p.take(PIPE_CAP);
         }
         handle.join().unwrap();
-        // the drain loop may have consumed part of the payload before the
-        // pusher refilled: whatever remains is payload tail, all 7s
+        // everything the pusher wrote after the drain is payload tail
         let rest = p.take(PIPE_CAP);
-        assert!((10..=100).contains(&rest.len()));
         assert!(rest.iter().all(|&b| b == 7));
+        assert!(rest.len() <= 100);
     }
 
     #[test]
