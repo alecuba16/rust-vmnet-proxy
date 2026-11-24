@@ -116,7 +116,28 @@ pub fn spawn(
     tuning: crate::config::Tuning,
     relays: Vec<crate::config::Relay>,
 ) -> Result<NetLoop, String> {
-    let dev = VmnetDevice::connect(socket_path, mac).map_err(|e| format!("vmnet connect: {e}"))?;
+    // Boot race: the socket_vmnet daemon may still be starting when the
+    // proxy launches (launchd starts both near-simultaneously). Bounded
+    // retry; on final failure the caller exits nonzero and the service
+    // supervisor (KeepAlive) respawns.
+    let mut dev = None;
+    let mut last_err = String::new();
+    for attempt in 1..=30 {
+        match VmnetDevice::connect(socket_path, mac) {
+            Ok(d) => {
+                dev = Some(d);
+                break;
+            }
+            Err(e) => {
+                if attempt == 1 {
+                    log::warn!("vmnet socket not ready ({e}), retrying");
+                }
+                last_err = e.to_string();
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        }
+    }
+    let dev = dev.ok_or_else(|| format!("vmnet connect: {last_err}"))?;
     let vmnet_fd = dev.raw_fd();
     let (wake_r, wake_w) = wake_pipe().map_err(|e| format!("wake pipe: {e}"))?;
     let (cmd_tx, cmd_rx): (Sender<NetCmd>, Receiver<NetCmd>) = channel();
