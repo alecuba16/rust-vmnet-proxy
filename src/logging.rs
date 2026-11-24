@@ -148,9 +148,9 @@ impl log::Log for Logger {
             return;
         }
         let mut line = String::with_capacity(192);
-        let _ = write!(
+        let _ = writeln!(
             line,
-            "[{} {:5} {}] {}\n",
+            "[{} {:5} {}] {}",
             timestamp(SystemTime::now()),
             record.level(),
             record.target(),
@@ -276,7 +276,7 @@ mod tests {
         let d = tmpdir("time");
         let mut s = sink_for(&d, 3600, 3, 0);
         s.write_line("young file stays\n");
-        assert!(d.join(format!("{LOG_FILE}.1")).exists() == false);
+        assert!(!d.join(format!("{LOG_FILE}.1")).exists());
         // age the anchor past the window: next write must rotate
         s.opened_at = SystemTime::now() - std::time::Duration::from_secs(3601);
         s.write_line("old file rotates\n");
