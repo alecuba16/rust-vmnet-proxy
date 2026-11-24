@@ -1,6 +1,6 @@
 [package]
 name = "rust-vmnet-proxy"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 description = "Rootless macOS proxy: direct SOCKS5 via bridged socket_vmnet plus supervised SSH tunnels"
 license = "MIT"
