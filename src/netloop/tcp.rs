@@ -124,7 +124,7 @@ pub fn service(state: &mut NetState, id: u64) -> bool {
                         return true;
                     }
                 }
-                if conn.tx_pipe.is_closed() && conn.tx_pipe.len() == 0 {
+                if conn.tx_pipe.is_closed() && conn.tx_pipe.is_empty() {
                     // client went away before SYN-ACK: nothing to deliver
                     sock.abort();
                     conn.rx_pipe.close();
@@ -158,7 +158,7 @@ pub fn service(state: &mut NetState, id: u64) -> bool {
     }
 
     // client EOF: FIN once all pending bytes are in the socket
-    if conn.tx_pipe.is_closed() && conn.tx_pipe.len() == 0 && sock.may_send() {
+    if conn.tx_pipe.is_closed() && conn.tx_pipe.is_empty() && sock.may_send() {
         sock.close();
     }
 

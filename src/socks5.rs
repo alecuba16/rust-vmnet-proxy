@@ -270,7 +270,7 @@ fn handle_client(mut client: TcpStream, api: NetApi, splice_timeout: Duration) {
             }
             // timeout or rx drained: keep waiting unless remote hit EOF
             Some(_) => {
-                if rx_pipe.is_closed() && rx_pipe.len() == 0 {
+                if rx_pipe.is_closed() && rx_pipe.is_empty() {
                     break;
                 }
             }

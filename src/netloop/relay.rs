@@ -215,7 +215,7 @@ fn spawn_forward(
                     }
                     // timeout or rx drained: keep waiting unless EOF
                     Some(_) => {
-                        if rx_pipe.is_closed() && rx_pipe.len() == 0 {
+                        if rx_pipe.is_closed() && rx_pipe.is_empty() {
                             break;
                         }
                     }
