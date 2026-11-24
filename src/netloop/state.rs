@@ -13,6 +13,11 @@ use crate::netloop::relay::RelayState;
 use crate::pipe::Pipe;
 use crate::vmnet_dev::VmnetDevice;
 
+/// Cap on the per-conn spill held when a Write command arrives while tx_pipe
+/// is full. Beyond it the conn is torn down: one wedged client must not hold
+/// unbounded netloop memory.
+const TX_SPILL_CAP: usize = 64 * 1024;
+
 /// Per-connection state held by the netloop.
 pub struct TcpConn {
     pub handle: SocketHandle,
@@ -21,10 +26,31 @@ pub struct TcpConn {
     pub rx_pipe: Arc<Pipe>,
     /// SOCKS client thread -> remote
     pub tx_pipe: Arc<Pipe>,
+    /// Bytes from a Write command that did not fit tx_pipe this pass.
+    /// Drained into tx_pipe by tcp::service as the socket drains.
+    pub tx_spill: Vec<u8>,
+    /// When tx_spill first went nonempty. A spill that cannot drain for
+    /// this long means the remote path is wedged: tear the conn down.
+    pub tx_stuck_since: Option<SmolInstant>,
     pub established: bool,
     pub connect_deadline: Option<smoltcp::time::Instant>,
     pub result_tx: Option<Sender<ConnectResult>>,
     pub result_sent: bool,
+}
+
+impl TcpConn {
+    /// Queue Write payload beyond what tx_pipe takes now. Returns false when
+    /// the spill cap is exceeded, meaning the conn must be torn down.
+    pub fn spill_write(&mut self, data: &[u8], now: SmolInstant) -> bool {
+        if self.tx_spill.is_empty() {
+            self.tx_stuck_since = Some(now);
+        }
+        if self.tx_spill.len() + data.len() > TX_SPILL_CAP {
+            return false;
+        }
+        self.tx_spill.extend_from_slice(data);
+        true
+    }
 }
 
 /// Pending DNS query: query id -> (smoltcp query handle, reply channel, deadline).
@@ -106,4 +132,8 @@ pub struct NetState<'a> {
     pub probe_socket: Option<SocketHandle>,
     /// Timing knobs for the rx watchdog.
     pub watchdog: WatchdogThresholds,
+    /// How long a full tx path may hold undrained spill before the conn is
+    /// torn down. The vmnet wedge keeps smoltcp tx buffers full for minutes;
+    /// the cap bounds how long one conn rides that out.
+    pub tx_stall: SmolDuration,
 }

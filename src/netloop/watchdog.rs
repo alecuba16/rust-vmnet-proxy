@@ -248,6 +248,7 @@ mod tests {
             last_watchdog_log: None,
             probe_socket: None,
             watchdog: WatchdogThresholds::default(),
+            tx_stall: SmolDuration::from_secs(30),
         }
     }
 

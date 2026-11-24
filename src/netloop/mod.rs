@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Duration as StdDuration;
 
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketSet};
 use smoltcp::socket::dhcpv4;
@@ -21,6 +22,54 @@ use crate::pipe::Pipe;
 use crate::vmnet_dev::VmnetDevice;
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Liveness channel from the netloop to the watchdog thread. The loop
+/// publishes its expected poll sleep right before poll(); a pass that
+/// completes republishes on the next iteration. The watchdog declares
+/// death only when silence exceeds the published expectation plus slack,
+/// so a legal long poll (battery mode trusts smoltcp timers, up to the DHCP
+/// T1) never trips it, while any park after poll (command handling, socket
+/// service) is caught within slack.
+#[derive(Default)]
+pub struct Liveness {
+    /// Wall-clock millis of the last publish (Unix epoch).
+    last_ms: AtomicU64,
+    /// Expected worst-case millis until the next publish. u64::MAX before
+    /// the first publish, so the watchdog ignores a not-yet-started loop.
+    expected_ms: AtomicU64,
+}
+
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+impl Liveness {
+    pub fn new() -> Liveness {
+        Liveness {
+            last_ms: AtomicU64::new(0),
+            expected_ms: AtomicU64::new(u64::MAX),
+        }
+    }
+
+    pub fn publish(&self, expected_ms: u64) {
+        self.expected_ms.store(expected_ms, Ordering::Relaxed);
+        self.last_ms.store(wall_ms(), Ordering::Release);
+    }
+
+    /// True when the loop went silent for longer than its published
+    /// expectation plus `slack`. u64::MAX expectation means not started yet.
+    pub fn is_dead(&self, slack: StdDuration) -> bool {
+        let last = self.last_ms.load(Ordering::Acquire);
+        let expected = self.expected_ms.load(Ordering::Relaxed);
+        if expected == u64::MAX {
+            return false;
+        }
+        wall_ms().saturating_sub(last) > expected.saturating_add(slack.as_millis() as u64)
+    }
+}
 
 pub(crate) fn next_conn_id() -> u64 {
     NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed)
@@ -91,6 +140,12 @@ impl NetApi {
 pub struct NetLoop {
     pub api: NetApi,
     pub join: JoinHandle<()>,
+    /// Liveness channel for the watchdog thread in main. The loop publishes
+    /// its expected poll sleep before every poll(); a netloop parked anywhere
+    /// else (command handling, socket service) stops publishing and the
+    /// watchdog restarts the process. The rx watchdog cannot catch this: it
+    /// runs inside the loop and shares the failure domain.
+    pub liveness: Arc<Liveness>,
 }
 
 /// Create the wake pipe and set both ends nonblocking. macOS libc has no
@@ -187,6 +242,8 @@ fn spawn_inner(
 
     let api = NetApi { tx: cmd_tx, wake_w };
     let loop_api = api.clone();
+    let liveness = Arc::new(Liveness::new());
+    let loop_liveness = Arc::clone(&liveness);
 
     let join = std::thread::Builder::new()
         .name("netloop".into())
@@ -195,15 +252,22 @@ fn spawn_inner(
                 dev,
                 LoopFds { vmnet_fd, wake_r },
                 cmd_rx,
-                tuning,
-                relays,
-                loop_api,
-                watchdog,
+                LoopCfg {
+                    tuning,
+                    relays,
+                    api: loop_api,
+                    watchdog,
+                    liveness: loop_liveness,
+                },
             )
         })
         .map_err(|e| format!("spawn netloop: {e}"))?;
 
-    Ok(NetLoop { api, join })
+    Ok(NetLoop {
+        api,
+        join,
+        liveness,
+    })
 }
 
 /// File descriptors the loop's poll() watches, moved into the loop thread.
@@ -212,15 +276,23 @@ struct LoopFds {
     wake_r: i32,
 }
 
-fn run(
-    mut dev: VmnetDevice,
-    fds: LoopFds,
-    cmd_rx: Receiver<NetCmd>,
+/// Everything the loop thread needs beyond the device and command channel.
+struct LoopCfg {
     tuning: crate::config::Tuning,
     relays: Vec<crate::config::Relay>,
     api: NetApi,
     watchdog: WatchdogThresholds,
-) {
+    liveness: Arc<Liveness>,
+}
+
+fn run(mut dev: VmnetDevice, fds: LoopFds, cmd_rx: Receiver<NetCmd>, cfg: LoopCfg) {
+    let LoopCfg {
+        tuning,
+        relays,
+        api,
+        watchdog,
+        liveness,
+    } = cfg;
     let mac = dev.mac();
     let if_cfg = IfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     let mut iface = Interface::new(if_cfg, &mut dev, SmolInstant::now());
@@ -254,6 +326,7 @@ fn run(
         last_watchdog_log: None,
         probe_socket: None,
         watchdog,
+        tx_stall: SmolDuration::from_secs(30),
     };
 
     if let Err(e) = relay::init(&mut state, &relays) {
@@ -290,6 +363,9 @@ fn run(
             },
         ];
         let timeout_ms = delay.total_millis() as i32;
+        // publish the expected sleep so the liveness watchdog can tell a
+        // legal long poll from a park; poll is the only legal long wait
+        liveness.publish(timeout_ms.max(0) as u64);
         let n = unsafe { libc::poll(pollfds.as_mut_ptr(), 2, timeout_ms) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
@@ -323,8 +399,25 @@ fn run(
                         tcp::start_connect(&mut state, id, remote, resp, pipes);
                     }
                     NetCmd::Write { id, data } => {
-                        if let Some(conn) = state.tcp_conns.get_mut(&id) {
-                            conn.tx_pipe.push(&data);
+                        if data.is_empty() {
+                            // pure wake nudge: never touches pipe capacity,
+                            // a full pipe must not park the netloop
+                            continue;
+                        }
+                        let Some(conn) = state.tcp_conns.get_mut(&id) else {
+                            continue;
+                        };
+                        let accepted = conn.tx_pipe.try_push(&data);
+                        let rest = &data[accepted..];
+                        if rest.is_empty() {
+                            continue;
+                        }
+                        if !conn.spill_write(rest, SmolInstant::now()) {
+                            log::warn!(
+                                "conn {} tx spill over cap: remote path wedged, closing",
+                                id
+                            );
+                            tcp::handle_close(&mut state, id);
                         }
                     }
                     NetCmd::Close { id } => {

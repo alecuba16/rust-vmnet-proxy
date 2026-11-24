@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::cmds::ConnectResult;
 use crate::netloop::NetApi;
+use crate::pipe::Deadline;
 
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 const SPLICE_CHUNK: usize = 16 * 1024;
@@ -19,6 +20,10 @@ pub struct SocksTuning {
     /// Splice thread take_blocking timeout. Battery mode parks without a
     /// cap (see pipe::take_blocking_park).
     pub splice_timeout: Duration,
+    /// How long the up splice thread may park on a full tx pipe before the
+    /// conn is treated as wedged and dropped. Bounded even in battery mode:
+    /// a parked splice thread that never wakes leaks one thread per conn.
+    pub push_stall: Duration,
 }
 
 /// Park the accept thread in the kernel until a connection arrives (or the
@@ -63,9 +68,9 @@ pub fn serve(listener: TcpListener, api: NetApi, tuning: SocksTuning) {
             Ok((client, _)) => {
                 let _ = client.set_nonblocking(false);
                 let api = api.clone();
-                let splice_timeout = tuning.splice_timeout;
+                let t = tuning.clone();
                 thread::Builder::new()
-                    .spawn(move || handle_client(client, api, splice_timeout))
+                    .spawn(move || handle_client(client, api, t))
                     .ok();
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
@@ -178,7 +183,8 @@ pub fn read_greeting(client: &mut TcpStream) -> bool {
 
 pub use HsError as SocksHsError;
 
-fn handle_client(mut client: TcpStream, api: NetApi, splice_timeout: Duration) {
+fn handle_client(mut client: TcpStream, api: NetApi, tuning: SocksTuning) {
+    let splice_timeout = tuning.splice_timeout;
     let _ = client.set_nodelay(true);
 
     if !read_greeting(&mut client) {
@@ -237,6 +243,7 @@ fn handle_client(mut client: TcpStream, api: NetApi, splice_timeout: Duration) {
     let mut up = client.try_clone().expect("clone client stream");
     let up_tx = tx_pipe;
     let up_handle = handle.clone();
+    let push_stall = tuning.push_stall;
     let up_thread = thread::Builder::new()
         .spawn(move || {
             let mut buf = [0u8; SPLICE_CHUNK];
@@ -244,7 +251,10 @@ fn handle_client(mut client: TcpStream, api: NetApi, splice_timeout: Duration) {
                 match up.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if !up_tx.push(&buf[..n]) {
+                        if !up_tx.push_with_deadline(&buf[..n], Deadline::after(push_stall)) {
+                            // full for the whole stall window or closed:
+                            // the remote path is wedged, drop the conn
+                            up_handle.close();
                             break;
                         }
                         // empty Write: no bytes, just wakes the netloop so
@@ -513,7 +523,15 @@ mod tests {
         let (mut c, s) = pair();
         let (fake, api) = FakeNet::spawn();
         let t = thread::spawn(move || {
-            handle_client(s, api, Duration::from_millis(200));
+            handle_client(
+                s,
+                api,
+                SocksTuning {
+                    accept_interval: Duration::from_millis(200),
+                    splice_timeout: Duration::from_millis(200),
+                    push_stall: Duration::from_millis(200),
+                },
+            );
         });
         // greeting
         c.write_all(&[0x05, 0x01, 0x00]).unwrap();
@@ -538,7 +556,15 @@ mod tests {
         let (mut c, s) = pair();
         let (fake, api) = FakeNet::spawn();
         let t = thread::spawn(move || {
-            handle_client(s, api, Duration::from_millis(200));
+            handle_client(
+                s,
+                api,
+                SocksTuning {
+                    accept_interval: Duration::from_millis(200),
+                    splice_timeout: Duration::from_millis(200),
+                    push_stall: Duration::from_millis(200),
+                },
+            );
         });
         c.write_all(&[0x05, 0x01, 0x00]).unwrap();
         let mut b = [0u8; 2];
@@ -640,6 +666,7 @@ mod tests {
         let tuning = SocksTuning {
             accept_interval: Duration::from_millis(10),
             splice_timeout: Duration::from_millis(10),
+            push_stall: Duration::from_millis(10),
         };
         let t = thread::spawn(move || serve(l, api, tuning));
         // cover the Ok(accept) branch: spawn a real SOCKS5 client that

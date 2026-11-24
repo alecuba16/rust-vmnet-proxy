@@ -71,6 +71,8 @@ pub fn start_connect(
         remote,
         rx_pipe: pipes.rx,
         tx_pipe: pipes.tx,
+        tx_spill: Vec::new(),
+        tx_stuck_since: None,
         established: false,
         connect_deadline: Some(SmolInstant::now() + CONNECT_TIMEOUT),
         result_tx: Some(resp),
@@ -157,8 +159,41 @@ pub fn service(state: &mut NetState, id: u64) -> bool {
         }
     }
 
-    // client EOF: FIN once all pending bytes are in the socket
-    if conn.tx_pipe.is_closed() && conn.tx_pipe.is_empty() && sock.may_send() {
+    // refill tx_pipe from the spill once the normal drain freed capacity;
+    // a stuck spill (vmnet tx wedged) tears the conn down after tx_stall
+    if !conn.tx_spill.is_empty() {
+        let moved = conn.tx_pipe.try_push(&conn.tx_spill);
+        if moved > 0 {
+            conn.tx_spill.drain(..moved);
+            if conn.tx_spill.is_empty() {
+                conn.tx_stuck_since = None;
+            }
+        }
+        let stuck_for = conn
+            .tx_stuck_since
+            .map(|t| SmolInstant::now() - t)
+            .unwrap_or(SmolDuration::ZERO);
+        if stuck_for >= state.tx_stall {
+            log::warn!(
+                "conn {} tx undrained for {}s: remote path wedged, closing",
+                id,
+                stuck_for.secs()
+            );
+            sock.abort();
+            conn.rx_pipe.close();
+            conn.tx_pipe.close();
+            let _ = state.sockets.remove(conn.handle);
+            return true;
+        }
+    }
+
+    // client EOF: FIN once all pending bytes are in the socket (spill
+    // included; FIN before drained spill would strand client bytes)
+    if conn.tx_pipe.is_closed()
+        && conn.tx_pipe.is_empty()
+        && conn.tx_spill.is_empty()
+        && sock.may_send()
+    {
         sock.close();
     }
 
@@ -176,10 +211,14 @@ pub fn service(state: &mut NetState, id: u64) -> bool {
 }
 
 /// Close command: graceful FIN when established, abort (RST) otherwise.
+/// Pending spill is dropped: a close means the caller is done with the
+/// conn, stranded spill bytes have nowhere to go.
 pub fn handle_close(state: &mut NetState, id: u64) {
     let Some(conn) = state.tcp_conns.get_mut(&id) else {
         return;
     };
+    conn.tx_spill.clear();
+    conn.tx_stuck_since = None;
     let sock = state.sockets.get_mut::<tcp::Socket>(conn.handle);
     if conn.established && sock.state() == tcp::State::Established {
         sock.close();
