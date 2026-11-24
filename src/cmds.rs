@@ -96,11 +96,11 @@ mod tests {
     use super::*;
     use std::sync::mpsc::{channel, Receiver};
 
-    fn handle() -> (ConnHandle, Receiver<NetCmd>, i32) {
+    fn handle() -> (ConnHandle, Receiver<NetCmd>, i32, i32) {
         let (tx, rx) = channel();
         let mut fds = [0i32; 2];
         unsafe { libc::pipe(fds.as_mut_ptr()) };
-        (ConnHandle::new(1, tx, fds[1]), rx, fds[1])
+        (ConnHandle::new(1, tx, fds[1]), rx, fds[1], fds[0])
     }
 
     #[test]
@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn write_and_close_send_commands_and_wake() {
-        let (h, rx, wake_w) = handle();
+        let (h, rx, wake_w, wake_r) = handle();
         h.write(vec![1, 2, 3]);
         assert!(matches!(
             rx.try_recv(),
@@ -144,7 +144,7 @@ mod tests {
         let mut byte = [0u8; 1];
         let mut got = false;
         for _ in 0..200 {
-            let n = unsafe { libc::read(wake_w - 1, byte.as_mut_ptr() as *mut libc::c_void, 1) };
+            let n = unsafe { libc::read(wake_r, byte.as_mut_ptr() as *mut libc::c_void, 1) };
             if n > 0 {
                 got = true;
                 break;
@@ -154,16 +154,20 @@ mod tests {
         assert!(got, "wake byte never landed in the pipe");
         unsafe {
             libc::close(wake_w);
-            libc::close(wake_w - 1);
+            libc::close(wake_r);
         }
     }
 
     #[test]
     fn clone_sends_on_same_channel() {
-        let (h, rx, _wake) = handle();
+        let (h, rx, wake_w, wake_r) = handle();
         let h2 = h.clone();
         assert_eq!(h2.id, h.id);
         h2.write(Vec::new());
         assert!(matches!(rx.try_recv(), Ok(NetCmd::Write { .. })));
+        unsafe {
+            libc::close(wake_w);
+            libc::close(wake_r);
+        }
     }
 }
