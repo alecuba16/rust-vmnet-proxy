@@ -9,6 +9,7 @@ use smoltcp::time::Duration as SmolDuration;
 use smoltcp::wire::Ipv4Address;
 
 use crate::cmds::{ConnectResult, NetCmd};
+use crate::netloop::relay::RelayState;
 use crate::pipe::Pipe;
 use crate::vmnet_dev::VmnetDevice;
 
@@ -40,6 +41,9 @@ pub struct NetState<'a> {
     pub sockets: SocketSet<'a>,
     pub dhcp_handle: SocketHandle,
     pub tcp_conns: HashMap<u64, TcpConn>,
+    /// Relay listeners by relay listen port. Accepted relay conns join
+    /// tcp_conns with ids from the shared NEXT_CONN_ID allocator.
+    pub relays: HashMap<u16, RelayState>,
     pub dns_pending: HashMap<u64, DnsPending>,
     pub next_dns_id: u64,
     pub dns_handle: Option<SocketHandle>,

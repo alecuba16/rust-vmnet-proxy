@@ -193,7 +193,7 @@ fn main() {
         );
     }
 
-    let net = match netloop::spawn(&cfg.vmnet_socket, mac, tuning) {
+    let net = match netloop::spawn(&cfg.vmnet_socket, mac, tuning, cfg.relays.clone()) {
         Ok(n) => n,
         Err(e) => {
             eprintln!("netloop error: {e}");
