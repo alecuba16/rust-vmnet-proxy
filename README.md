@@ -91,6 +91,10 @@ Config lives at `~/.config/rust-vmnet-proxy/config.yaml` (override with
         host: bastion-a
         mode: local_forward        # ssh -N -L 127.0.0.1:1086:10.0.0.5:3000
         forward: 10.0.0.5:3000
+    relays:
+      - name: webui-lan
+        listen: 8787                # LAN clients connect here (vmnet stack address)
+        target: 127.0.0.1:8787    # forwarded to this Mac-side endpoint
 
 Options:
 
@@ -108,6 +112,11 @@ Options:
     poll). Snappier, more wakeups, more battery.
 - `ssh_legs`: supervised SSH tunnels. `dynamic` gives a SOCKS5 listener
   via the bastion, `local_forward` relays one TCP endpoint.
+- `relays`: inbound LAN listeners on the vmnet stack's own address,
+  each forwarded to a Mac-side endpoint. The bridged vmnet address is
+  below WARP's flow-level capture, so LAN devices can reach services
+  on the Mac even when inbound connections to the physical interface
+  are dropped. TLS passes through untouched.
 
 ## Command reference
 

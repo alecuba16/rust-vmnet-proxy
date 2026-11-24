@@ -131,6 +131,24 @@ struct ConfigRaw {
     mac: Option<String>,
     power_mode: Option<String>,
     ssh_legs: Option<Vec<SshLegRaw>>,
+    relays: Option<Vec<RelayRaw>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Relay {
+    /// Log-friendly label, defaults to the listen port.
+    pub name: String,
+    /// Port on the vmnet stack's LAN address where LAN clients connect.
+    pub listen: u16,
+    /// Mac-side endpoint the connection is forwarded to.
+    pub target: SocketAddr,
+}
+
+#[derive(Debug, Deserialize)]
+struct RelayRaw {
+    name: Option<String>,
+    listen: u16,
+    target: String,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +158,7 @@ pub struct Config {
     pub mac: Option<[u8; 6]>,
     pub power_mode: PowerMode,
     pub ssh_legs: Vec<SshLeg>,
+    pub relays: Vec<Relay>,
     /// True when no config file was found and built-in defaults were used.
     pub from_defaults: bool,
 }
@@ -152,6 +171,7 @@ impl Default for Config {
             mac: None,
             power_mode: PowerMode::default(),
             ssh_legs: Vec::new(),
+            relays: Vec::new(),
             from_defaults: false,
         }
     }
@@ -294,13 +314,33 @@ impl Config {
             }
             None => def.ssh_legs,
         };
+        let relays = match raw.relays {
+            Some(entries) => {
+                let mut out = Vec::new();
+                for r in entries {
+                    let target: SocketAddr = r
+                        .target
+                        .parse()
+                        .map_err(|e| format!("bad target for relay {}: {e}", r.listen))?;
+                    out.push(Relay {
+                        name: r.name.unwrap_or_else(|| r.listen.to_string()),
+                        listen: r.listen,
+                        target,
+                    });
+                }
+                out
+            }
+            None => def.relays,
+        };
         validate_ports(&ssh_legs)?;
+        validate_relay_ports(&relays, &ssh_legs, socks_listen)?;
         Ok(Config {
             vmnet_socket,
             socks_listen,
             mac,
             power_mode,
             ssh_legs,
+            relays,
             from_defaults: false,
         })
     }
@@ -328,6 +368,52 @@ fn validate_ports(legs: &[SshLeg]) -> Result<(), String> {
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+/// Relay listen ports must be unique among relays and must not collide with
+/// any leg listen/upstream port or the direct SOCKS listener: relays bind on
+/// the vmnet stack's own address (separate address space from the Mac's
+/// stack), but keeping every configured port distinct catches copy-paste
+/// mistakes early and keeps the port map easy to read.
+fn validate_relay_ports(
+    relays: &[Relay],
+    legs: &[SshLeg],
+    socks_listen: SocketAddr,
+) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for relay in relays {
+        if relay.listen == 0 {
+            return Err(format!("relay {}: listen port must not be 0", relay.name));
+        }
+        if !seen.insert(relay.listen) {
+            return Err(format!(
+                "relay {}: listen port {} collides with another relay",
+                relay.name, relay.listen
+            ));
+        }
+    }
+    for leg in legs {
+        if seen.contains(&leg.listen) {
+            return Err(format!(
+                "relay listen port {} collides with leg {} listen",
+                leg.listen, leg.listen
+            ));
+        }
+        if seen.contains(&leg.upstream) {
+            return Err(format!(
+                "relay listen port {} collides with leg {} upstream",
+                leg.upstream, leg.listen
+            ));
+        }
+    }
+    if relays.iter().any(|r| r.listen == socks_listen.port()) {
+        return Err(format!(
+            "relay listen port {} collides with socks_listen {}",
+            socks_listen.port(),
+            socks_listen
+        ));
     }
     Ok(())
 }
@@ -648,6 +734,84 @@ mod tests {
         // listen for the ssh -D bind and never read upstream or headers
         assert_eq!(leg.upstream, 10001);
         assert!(leg.http_headers.is_some());
+    }
+
+    #[test]
+    fn load_relays_happy() {
+        let p = write_cfg(
+            "relays:\n  - name: herdr\n    listen: 8787\n    target: 127.0.0.1:8787\n  - listen: 2222\n    target: 127.0.0.1:22\n",
+        );
+        let c = Config::load_with(Some(p.to_str().unwrap()), None, "/nonexistent".into()).unwrap();
+        assert_eq!(c.relays.len(), 2);
+        assert_eq!(c.relays[0].name, "herdr");
+        assert_eq!(c.relays[0].listen, 8787);
+        assert_eq!(c.relays[0].target.to_string(), "127.0.0.1:8787");
+        // name defaults to the port when absent
+        assert_eq!(c.relays[1].name, "2222");
+        assert_eq!(c.relays[1].target.port(), 22);
+    }
+
+    #[test]
+    fn load_relays_bad_target() {
+        let p = write_cfg("relays:\n  - listen: 8787\n    target: nope\n");
+        assert!(
+            Config::load_with(Some(p.to_str().unwrap()), None, String::new())
+                .unwrap_err()
+                .starts_with("bad target")
+        );
+    }
+
+    #[test]
+    fn load_relays_duplicate_listen() {
+        let p = write_cfg(
+            "relays:\n  - listen: 8787\n    target: 127.0.0.1:1\n  - listen: 8787\n    target: 127.0.0.1:2\n",
+        );
+        assert!(
+            Config::load_with(Some(p.to_str().unwrap()), None, String::new())
+                .unwrap_err()
+                .contains("collides with another relay")
+        );
+    }
+
+    #[test]
+    fn load_relay_collides_with_socks_listen() {
+        let p = write_cfg(
+            "socks_listen: 127.0.0.1:1080\nrelays:\n  - listen: 1080\n    target: 127.0.0.1:1\n",
+        );
+        assert!(
+            Config::load_with(Some(p.to_str().unwrap()), None, String::new())
+                .unwrap_err()
+                .contains("collides with socks_listen")
+        );
+    }
+
+    #[test]
+    fn load_relay_collides_with_leg_listen() {
+        let p = write_cfg(
+            "ssh_legs:\n  - listen: 1081\n    host: h\n    mode: dynamic\nrelays:\n  - listen: 1081\n    target: 127.0.0.1:1\n",
+        );
+        assert!(
+            Config::load_with(Some(p.to_str().unwrap()), None, String::new())
+                .unwrap_err()
+                .contains("collides with leg 1081 listen")
+        );
+    }
+
+    #[test]
+    fn load_relay_zero_listen_rejected() {
+        let p = write_cfg("relays:\n  - listen: 0\n    target: 127.0.0.1:1\n");
+        assert!(
+            Config::load_with(Some(p.to_str().unwrap()), None, String::new())
+                .unwrap_err()
+                .contains("must not be 0")
+        );
+    }
+
+    #[test]
+    fn load_relays_absent_defaults_empty() {
+        let p = write_cfg("socks_listen: 127.0.0.1:1234\n");
+        let c = Config::load_with(Some(p.to_str().unwrap()), None, String::new()).unwrap();
+        assert!(c.relays.is_empty());
     }
 
     #[test]

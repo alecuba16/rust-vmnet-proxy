@@ -73,3 +73,15 @@ ssh_legs:
     host: jump-host-c
     mode: local_forward
     forward: 10.0.0.5:3000
+
+# LAN relays: inbound TCP listeners on the vmnet stack's own LAN address
+# (the DHCP address of the userspace stack, e.g. 192.168.1.x). Under a
+# flow-level VPN capture like Cloudflare WARP MASQUE, inbound connections
+# to the Mac's physical interface are dropped; the bridged vmnet address is
+# below the capture, so LAN devices can reach these ports. Each connection
+# is forwarded to `target` dialed from the Mac's normal stack (loopback
+# services included). Omit relays entirely for outbound-only setups.
+relays:
+  - name: webui-lan
+    listen: 8787
+    target: 127.0.0.1:8787

@@ -50,6 +50,7 @@ connect to the same socket as regular clients; sharing it is fine.
 | `mac` | string | derived | Source MAC on the bridge, format `aa:bb:cc:dd:ee:ff` (six colon-separated hex byte pairs, case-insensitive, each 00 to FF). Default derives from the FNV-1a hash of the socket path: locally administered (first byte 02), unicast, deterministic across reboots. Two clients on the same daemon must have distinct MACs. |
 | `power_mode` | string, `battery` or `performance` | `battery` | Idle wake behavior. See the power section. |
 | `ssh_legs` | list | empty | Supervised SSH legs. See below. |
+| `relays` | list | empty | LAN relays: inbound listeners on the vmnet stack address. See below. |
 
 ## ssh_legs
 
@@ -74,6 +75,36 @@ Validation rules:
 - Unknown `source`, `mode`, or `power_mode` values are config errors.
 - `bind` or `upstream` or `http_headers` on a masquerade leg: warning,
   ignored.
+
+## relays
+
+Each entry is an inbound TCP port on the vmnet stack's own LAN address
+(the DHCP address of the userspace stack) forwarded to a Mac-side
+endpoint. The use case: under a flow-level VPN capture like Cloudflare
+WARP MASQUE, inbound connections to the Mac's physical interface are
+dropped, but the bridged vmnet address sits below the capture. LAN
+devices connect to the stack's address directly, and the proxy relays
+to services on the Mac (loopback included) or anywhere else reachable
+from the Mac's normal stack.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `name` | string | the listen port | Log-friendly label. |
+| `listen` | u16, 1-65535 | required | Port on the vmnet stack's LAN address where LAN clients connect. |
+| `target` | SocketAddr | required | Mac-side endpoint the connection is forwarded to, e.g. `127.0.0.1:8787`. Dialed with the normal Mac stack, so it can be a loopback service, another host, or anything the Mac reaches. |
+
+Validation rules:
+- Relay listen ports must be unique among relays.
+- A relay listen port must not collide with any leg `listen` or
+  `upstream` port or with `socks_listen` (config error, even though
+  the relay binds a different address space: distinct ports keep the
+  map readable).
+- Port 0 is rejected.
+- Data path: accepted LAN connections join the same connection
+  machinery as direct SOCKS5, with the same backpressure (bounded
+  pipes, per-connection splice threads). The LAN-facing TCP is
+  terminated by the userspace stack; the target connection is a normal
+  Mac TCP connection. TLS passes through untouched.
 
 ## http_headers (identify legs)
 

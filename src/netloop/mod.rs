@@ -1,5 +1,6 @@
 pub mod dhcp;
 pub mod dns;
+pub mod relay;
 pub mod state;
 pub mod tcp;
 
@@ -19,6 +20,10 @@ use crate::pipe::Pipe;
 use crate::vmnet_dev::VmnetDevice;
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_conn_id() -> u64 {
+    NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Sender wrapper enforcing the wake discipline: every command nudges the
 /// wake pipe, otherwise the netloop could sleep in poll() with work queued.
@@ -40,6 +45,12 @@ impl NetApi {
 
     pub fn resolve(&self, name: String, resp: Sender<Option<Vec<std::net::IpAddr>>>) {
         self.send(NetCmd::Resolve { name, resp });
+    }
+
+    /// Handle given to a relay forward thread for one LAN connection.
+    /// Same wake discipline as SOCKS client handles.
+    pub fn relay_handle(&self, conn_id: u64) -> crate::cmds::ConnHandle {
+        crate::cmds::ConnHandle::new(conn_id, self.tx.clone(), self.wake_w)
     }
 
     /// Start a proxied TCP connection. Returns the conn handle (whose
@@ -103,6 +114,7 @@ pub fn spawn(
     socket_path: &str,
     mac: [u8; 6],
     tuning: crate::config::Tuning,
+    relays: Vec<crate::config::Relay>,
 ) -> Result<NetLoop, String> {
     let dev = VmnetDevice::connect(socket_path, mac).map_err(|e| format!("vmnet connect: {e}"))?;
     let vmnet_fd = dev.raw_fd();
@@ -110,10 +122,11 @@ pub fn spawn(
     let (cmd_tx, cmd_rx): (Sender<NetCmd>, Receiver<NetCmd>) = channel();
 
     let api = NetApi { tx: cmd_tx, wake_w };
+    let loop_api = api.clone();
 
     let join = std::thread::Builder::new()
         .name("netloop".into())
-        .spawn(move || run(dev, vmnet_fd, wake_r, cmd_rx, tuning))
+        .spawn(move || run(dev, vmnet_fd, wake_r, cmd_rx, tuning, relays, loop_api))
         .map_err(|e| format!("spawn netloop: {e}"))?;
 
     Ok(NetLoop { api, join })
@@ -125,6 +138,8 @@ fn run(
     wake_r: i32,
     cmd_rx: Receiver<NetCmd>,
     tuning: crate::config::Tuning,
+    relays: Vec<crate::config::Relay>,
+    api: NetApi,
 ) {
     let mac = dev.mac();
     let if_cfg = IfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
@@ -141,6 +156,7 @@ fn run(
         sockets,
         dhcp_handle,
         tcp_conns: std::collections::HashMap::new(),
+        relays: std::collections::HashMap::new(),
         dns_pending: std::collections::HashMap::new(),
         next_dns_id: 1,
         dns_handle: None,
@@ -149,6 +165,11 @@ fn run(
         online: false,
         poll_max: tuning.poll_max,
     };
+
+    if let Err(e) = relay::init(&mut state, &relays) {
+        log::error!("{e}");
+        return;
+    }
 
     loop {
         if !crate::RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
@@ -237,6 +258,7 @@ fn run(
 
         dhcp::service(&mut state);
         dns::service(&mut state);
+        relay::service(&mut state, &api, tuning.splice_timeout);
 
         let ids: Vec<u64> = state.tcp_conns.keys().copied().collect();
         for id in ids {
