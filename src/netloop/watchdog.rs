@@ -149,10 +149,12 @@ fn disarm(state: &mut NetState) {
 /// 340s). On a healthy path the probe's ARP reply refreshes
 /// `last_unicast_rx`; that refresh must NOT reset this cadence, or the
 /// heartbeat fires every `unicast_silence` and the `heartbeat` knob is dead
-/// (observed live: 20s cadence). So the heartbeat clock starts when silence
-/// first crosses the threshold and keeps ticking through probe-induced
-/// refreshes; it only restarts when genuine traffic (client unicast) breaks
-/// the silence for real. Unanswered probes escalate visibility one WARN at
+/// (observed live: pass-rate storm in 0.2.6, threshold-rate cadence in
+/// 0.2.7, both with a 60s knob). The distinguisher is the outstanding-probe
+/// flag: a unicast refresh while a heartbeat probe is unanswered is our
+/// own reply landing, so it pays the debt and keeps the clock; a refresh
+/// with no probe outstanding is genuine client traffic and ends the phase.
+/// Unanswered probes escalate visibility one WARN at
 /// a time so a demand-less half wedge stays visible in the log.
 ///
 /// The heartbeat socket survives healthy passes: disarm() must not reclaim
@@ -171,17 +173,25 @@ pub fn heartbeat(state: &mut NetState) {
         return;
     }
     if uc_silent_for < th.unicast_silence {
-        // Silence is genuinely broken (client unicast, not our own probe
-        // reply: a probe reply would keep silence just under the threshold
-        // for one pass at most). Restart the heartbeat phase.
-        end_heartbeat_phase(state);
+        // Unicast is flowing again. If a probe is outstanding, this frame is
+        // our own probe's ARP reply landing: pay the debt and KEEP the
+        // clock, or the phase resets here every interval and the heartbeat
+        // degenerates to unicast_silence cadence (observed live in 0.2.7:
+        // 20s probes despite a 60s knob). A refresh with no probe
+        // outstanding is genuine client traffic; only that ends the phase.
+        // Sustained client traffic while a probe happened to be in flight
+        // ends the phase one pass later, which is the accepted cost.
+        if state.heartbeat_unanswered > 0 {
+            state.heartbeat_unanswered = 0;
+        } else {
+            end_heartbeat_phase(state);
+        }
         return;
     }
-    // The one-pass claim above needs the probe cadence slower than the
-    // unicast threshold; faster heartbeats keep silence permanently under
-    // the threshold and the phase resets every pass (the 20s-cadence
-    // regression back through config). Defaults hold; the e2e tuning
-    // shortens both together.
+    // If the heartbeat were tuned faster than unicast_silence, the probe's
+    // own reply would keep silence below the threshold forever and the knob
+    // would be dead (cadence pinned to unicast_silence). Defaults hold; the
+    // e2e tuning shortens both together.
     debug_assert!(th.heartbeat >= th.unicast_silence);
     let due = match state.last_heartbeat {
         Some(t) => now - t >= th.heartbeat,
@@ -523,32 +533,43 @@ mod tests {
         state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(30);
         heartbeat(&mut state);
         assert_eq!(state.heartbeat_unanswered, 1);
+        let first = state.last_heartbeat.expect("heartbeat armed");
 
         // Probe's own ARP reply arrives: unicast fresh again, but for less
-        // than a heartbeat interval. Heartbeat must NOT reset its clock to
-        // fire immediately once silence recrosses; genuine client traffic
-        // is what resets, and only when silence stays broken.
+        // than a heartbeat interval. A probe is outstanding, so the refresh
+        // pays the debt and KEEPS the 60s clock; firing again at the 20s
+        // arm threshold is exactly the 0.2.7 live regression.
         state.last_unicast_rx = SmolInstant::now();
         heartbeat(&mut state);
-        assert_eq!(state.last_heartbeat, None, "genuine traffic resets phase");
+        assert_eq!(state.heartbeat_unanswered, 0, "probe reply pays the debt");
+        assert_eq!(
+            state.last_heartbeat,
+            Some(first),
+            "probe reply must not reset the 60s clock"
+        );
 
         // Silence recrosses the threshold before the 60s interval elapsed
-        // (e.g. 25s after the first heartbeat): the phase restarted above,
-        // so a heartbeat fires at the arm threshold. That is the accepted
-        // trade: real traffic ends the phase, the next idle gap starts a
-        // fresh one.
+        // (e.g. 25s after the first heartbeat): the clock survived, so no
+        // heartbeat fires. That is the fix: the phase only restarts on
+        // genuine client traffic with no probe outstanding.
         state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(30);
         heartbeat(&mut state);
-        assert!(state.last_heartbeat.is_some());
-        assert_eq!(state.heartbeat_unanswered, 1, "new phase, counter reset");
+        assert_eq!(
+            state.last_heartbeat,
+            Some(first),
+            "threshold recross must not fire a heartbeat"
+        );
+        assert_eq!(state.heartbeat_unanswered, 0, "nothing outstanding again");
 
         // Now the wedge case: silence sustained, gateway never answers.
-        // Clock advanced past the interval: next heartbeat fires and the
-        // unanswered counter climbs, driving the visibility WARN.
+        // Clock advanced past the interval: next heartbeat fires. Debt was
+        // paid, so the counter restarts from zero and climbs toward the
+        // visibility WARN on the probe after this one.
         state.last_heartbeat = Some(SmolInstant::now() - SmolDuration::from_secs(61));
         state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(90);
         heartbeat(&mut state);
-        assert_eq!(state.heartbeat_unanswered, 2);
+        assert_eq!(state.heartbeat_unanswered, 1);
+        assert!(state.last_heartbeat.unwrap() > first);
     }
 
     #[test]
@@ -592,8 +613,10 @@ mod tests {
         assert_eq!(state.heartbeat_unanswered, 1);
         assert!(state.last_heartbeat.is_some());
 
-        // silence broken for real: heartbeat ends its own phase and
-        // reclaims the socket
+        // Probe reply landed in between (debt paid), then genuine client
+        // traffic breaks the silence: no probe outstanding, so heartbeat
+        // ends its own phase and reclaims the socket.
+        state.heartbeat_unanswered = 0;
         state.last_unicast_rx = SmolInstant::now();
         heartbeat(&mut state);
         assert!(state.heartbeat_socket.is_none());
