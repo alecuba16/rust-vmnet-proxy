@@ -180,9 +180,18 @@ pub fn heartbeat(state: &mut NetState) {
         // the phase resets here every interval and the heartbeat degenerates
         // to unicast_silence cadence (observed live in 0.2.7: 20s probes
         // despite a 60s knob). A refresh with no probe outstanding is
-        // genuine client traffic; only that ends the phase. Sustained client
+        // genuine client traffic; only a refresh strictly newer than the
+        // reply snapshot ends the phase, the same refresh re-presented pass
+        // after pass must not (observed live in 0.2.8: the pass right after
+        // the debt was paid classified the identical refresh as genuine
+        // traffic and pinned the cadence back to 20s). Sustained client
         // traffic while a probe happened to be in flight ends the phase one
-        // pass later, which is the accepted cost.
+        // pass later, which is the accepted cost. Second accepted cost:
+        // with two probes outstanding (reply latency >= heartbeat interval,
+        // a pathologically slow gateway), the second reply is strictly newer
+        // than the first reply's snapshot and ends the phase on our own
+        // probe; one off-cadence probe, self-limiting, no storm, no
+        // liveness loss.
         if state.heartbeat_unanswered > 0 {
             state.heartbeat_unanswered = 0;
             state.heartbeat_reply_rx = Some(state.last_unicast_rx);
@@ -757,6 +766,48 @@ mod tests {
         heartbeat(&mut state);
         assert_eq!(state.heartbeat_unanswered, 0, "check's reply pays the debt");
         assert!(state.last_heartbeat.is_some(), "clock kept");
+    }
+
+    #[test]
+    fn heartbeat_delayed_second_reply_ends_phase_as_genuine() {
+        // Accepted cost pinned: with two probes outstanding (reply latency
+        // >= heartbeat interval, a pathologically slow gateway), the first
+        // reply pays the debt and snapshots, the second reply is strictly
+        // newer and ends the phase. One off-cadence probe, self-limiting.
+        let mut state = test_state(true);
+        state.ever_unicast_rx = true;
+        state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
+        state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(90);
+        heartbeat(&mut state);
+        assert_eq!(state.heartbeat_unanswered, 1);
+
+        // Second heartbeat fires before any reply landed: two probes out.
+        state.last_heartbeat = Some(SmolInstant::now() - SmolDuration::from_secs(61));
+        heartbeat(&mut state);
+        assert_eq!(state.heartbeat_unanswered, 2);
+        assert!(state.last_heartbeat.is_some());
+
+        // First reply lands: debt paid, snapshot taken, clock kept.
+        state.last_unicast_rx = SmolInstant::now();
+        heartbeat(&mut state);
+        assert_eq!(state.heartbeat_unanswered, 0);
+        assert!(
+            state.last_heartbeat.is_some(),
+            "first reply keeps the phase"
+        );
+
+        // The same refresh re-presented next pass: still no phase end.
+        heartbeat(&mut state);
+        assert!(state.last_heartbeat.is_some());
+
+        // Second reply lands (strictly newer): ends the phase on our own
+        // probe's reply. Accepted cost: one off-cadence probe, then the
+        // fresh phase is stable at heartbeat cadence.
+        state.last_unicast_rx = SmolInstant::now() + SmolDuration::from_millis(1);
+        heartbeat(&mut state);
+        assert_eq!(state.last_heartbeat, None, "second reply ends the phase");
+        assert_eq!(state.heartbeat_unanswered, 0);
+        assert!(state.heartbeat_socket.is_none());
     }
 
     #[test]
