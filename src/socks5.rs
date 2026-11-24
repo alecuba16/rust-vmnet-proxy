@@ -194,12 +194,20 @@ fn handle_client(mut client: TcpStream, api: NetApi, splice_timeout: Duration) {
         Err(HsError::Io) => return,
     };
 
+    // Log label: the domain name, or the literal IP when the client sent an
+    // address instead of a hostname.
+    let ip_literal = ip;
     let ip = match ip {
         Some(ip) => Some(ip),
         None => resolve(&api, &name),
     };
+    let host_label = if name.is_empty() {
+        ip_literal.map_or_else(|| "unknown".to_string(), |ip| ip.to_string())
+    } else {
+        name
+    };
     let Some(ip) = ip else {
-        log::warn!("CONNECT {}:{}, DNS resolve failed", name, port);
+        log::warn!("CONNECT {}:{}, DNS resolve failed", host_label, port);
         send_reply(&mut client, 0x04);
         return;
     };
@@ -216,19 +224,11 @@ fn handle_client(mut client: TcpStream, api: NetApi, splice_timeout: Duration) {
         return;
     }
     if !matches!(result, ConnectResult::Ok) {
-        log::warn!("CONNECT {}:{}, {}", name, port, result.describe());
+        log::warn!("CONNECT {}:{}, {}", host_label, port, result.describe());
         return;
     }
 
-    log::info!(
-        "CONNECT {}:{} -> {remote} [direct]",
-        if name.is_empty() {
-            ip.to_string()
-        } else {
-            name
-        },
-        port
-    );
+    log::info!("CONNECT {}:{port} -> {remote} [direct]", host_label);
 
     // Classic per-direction splice: a blocking client read in the same loop
     // as the rx drain deadlocks (responses pile up in rx while the thread
