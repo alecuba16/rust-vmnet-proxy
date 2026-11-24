@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "rust-vmnet-proxy"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "libc",
  "log",
