@@ -81,21 +81,8 @@ pub fn check(state: &mut NetState) -> bool {
     };
 
     if state.probe_started.is_none() {
-        let (kind, gap) = if unicast_wedged {
-            ("unicast rx", uc_silent_for)
-        } else {
-            ("rx", silent_for)
-        };
-        warn_once(
-            state,
-            now,
-            format!(
-                "{kind} silent for {}s while online; probing gateway {}",
-                gap.secs(),
-                gateway
-            ),
-        );
         state.probe_started = Some(now);
+        state.last_heartbeat = None;
     }
 
     // Re-probe every pass while the window runs: neighbor discovery is
@@ -105,6 +92,25 @@ pub fn check(state: &mut NetState) -> bool {
 
     let probed_for = now - state.probe_started.expect("armed above");
     if probed_for < th.probe_window {
+        // Benign idle gaps on a quiet LAN arm the window and disarm seconds
+        // later when the probe's own ARP reply lands. Only a gateway that
+        // stays silent past half the window earns a WARN.
+        if probed_for >= th.probe_window / 2 {
+            let (kind, gap) = if unicast_wedged {
+                ("unicast rx", uc_silent_for)
+            } else {
+                ("rx", silent_for)
+            };
+            warn_once(
+                state,
+                now,
+                format!(
+                    "{kind} silent for {}s while online; gateway {} not answering",
+                    gap.secs(),
+                    gateway
+                ),
+            );
+        }
         return false;
     }
 
@@ -129,6 +135,47 @@ fn disarm(state: &mut NetState) {
             let _ = state.sockets.remove(h);
         }
     }
+}
+
+/// Demand-independent gateway heartbeat. Once unicast has been silent past
+/// the unicast threshold while online, probe the gateway every
+/// `th.heartbeat` regardless of client demand: an idle LAN would otherwise
+/// hide a real unicast wedge until a client asks for something (observed:
+/// 340s). The probe's ARP reply refreshes `last_unicast_rx` on a healthy
+/// path, and on a wedged one it keeps the failure visible without demand.
+/// The probe socket created here is the watchdog's own; disarm() reclaims it
+/// once traffic resumes.
+pub fn heartbeat(state: &mut NetState) {
+    if !state.online || state.gateway.is_none() {
+        state.last_heartbeat = None;
+        return;
+    }
+    let now = SmolInstant::now();
+    let uc_silent_for = now - state.last_unicast_rx;
+    let th = state.watchdog;
+    if th.heartbeat == SmolDuration::ZERO
+        || !state.ever_unicast_rx
+        || uc_silent_for < th.unicast_silence
+    {
+        state.last_heartbeat = None;
+        return;
+    }
+    let due = match state.last_heartbeat {
+        Some(t) => now - t >= th.heartbeat,
+        None => true,
+    };
+    if due {
+        probe_gateway(state, state.gateway.expect("checked above"));
+        state.last_heartbeat = Some(now);
+    }
+}
+
+/// Force neighbor discovery for the gateway right after a lease lands, so a
+/// renewal cycle cannot leave the unicast path riding on a stale neighbor
+/// entry (observed: blackouts begin seconds after Configured).
+pub fn refresh_gateway(state: &mut NetState, gateway: smoltcp::wire::Ipv4Address) {
+    probe_gateway(state, gateway);
+    state.last_heartbeat = None;
 }
 
 /// Local port for the probe socket; bind(0) is rejected by smoltcp, and any
@@ -247,6 +294,7 @@ mod tests {
             probe_started: None,
             last_watchdog_log: None,
             probe_socket: None,
+            last_heartbeat: None,
             watchdog: WatchdogThresholds::default(),
             tx_stall: SmolDuration::from_secs(30),
         }
@@ -405,5 +453,70 @@ mod tests {
         state.demand_pending = true;
         assert!(!check(&mut state));
         assert!(state.probe_started.is_none());
+    }
+
+    #[test]
+    fn heartbeat_probes_past_unicast_silence_without_demand() {
+        // The 340s blind spot: unicast silent, no client demand, nothing
+        // would arm the watchdog. The heartbeat keeps the path visible
+        // (and heals expired neighbor entries) on its own.
+        let mut state = test_state(true);
+        state.ever_unicast_rx = true;
+        state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
+        state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(30);
+        state.demand_pending = false;
+        heartbeat(&mut state);
+        assert!(state.probe_socket.is_some(), "heartbeat armed no probe");
+        assert!(state.last_heartbeat.is_some());
+        assert!(
+            state.probe_started.is_none(),
+            "heartbeat must not arm the exit path"
+        );
+    }
+
+    #[test]
+    fn heartbeat_skips_fresh_unicast_offline_and_no_baseline() {
+        let mut state = test_state(true);
+        state.ever_unicast_rx = true;
+        state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
+        state.last_unicast_rx = SmolInstant::now(); // unicast flowing
+        heartbeat(&mut state);
+        assert!(state.probe_socket.is_none());
+        assert!(state.last_heartbeat.is_none());
+
+        state.online = false; // offline: DHCP retries own recovery
+        state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(600);
+        heartbeat(&mut state);
+        assert!(state.probe_socket.is_none());
+
+        state.online = true; // online but never saw unicast: no baseline
+        state.ever_unicast_rx = false;
+        heartbeat(&mut state);
+        assert!(state.probe_socket.is_none());
+    }
+
+    #[test]
+    fn heartbeat_rate_limits_while_gateway_stays_silent() {
+        let mut state = test_state(true);
+        state.ever_unicast_rx = true;
+        state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
+        state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(30);
+        heartbeat(&mut state);
+        assert!(state.last_heartbeat.is_some());
+        // Second call within the interval must not advance the timer or
+        // spam the socket.
+        let first = state.last_heartbeat;
+        heartbeat(&mut state);
+        assert_eq!(state.last_heartbeat, first);
+    }
+
+    #[test]
+    fn refresh_gateway_forces_probe_and_restarts_heartbeat_clock() {
+        let mut state = test_state(true);
+        state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
+        state.last_heartbeat = Some(SmolInstant::now());
+        refresh_gateway(&mut state, Ipv4Address::new(192, 168, 1, 1));
+        assert!(state.probe_socket.is_some(), "lease probe armed no ARP");
+        assert!(state.last_heartbeat.is_none());
     }
 }

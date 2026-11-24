@@ -280,6 +280,7 @@ fn unicast_wedge_with_pending_connect_exits_netloop() {
             silence: SmolDuration::from_secs(45),
             unicast_silence: SmolDuration::from_secs(2),
             probe_window: SmolDuration::from_secs(2),
+            heartbeat: SmolDuration::from_secs(60),
         },
     )
     .unwrap();

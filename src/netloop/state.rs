@@ -70,6 +70,11 @@ pub struct WatchdogThresholds {
     pub unicast_silence: SmolDuration,
     /// How long the gateway probe must stay unanswered before exit.
     pub probe_window: SmolDuration,
+    /// Interval for the demand-independent gateway heartbeat once unicast
+    /// has been silent past `unicast_silence`. The ARP reply refreshes
+    /// `last_unicast_rx`, bounding how long a real unicast wedge can hide
+    /// behind missing client demand.
+    pub heartbeat: SmolDuration,
 }
 
 impl Default for WatchdogThresholds {
@@ -78,6 +83,7 @@ impl Default for WatchdogThresholds {
             silence: SmolDuration::from_secs(45),
             unicast_silence: SmolDuration::from_secs(20),
             probe_window: SmolDuration::from_secs(15),
+            heartbeat: SmolDuration::from_secs(60),
         }
     }
 }
@@ -130,6 +136,10 @@ pub struct NetState<'a> {
     /// UDP socket used to force ARP for the gateway while the probe window
     /// runs; removed on disarm.
     pub probe_socket: Option<SocketHandle>,
+    /// When the heartbeat last probed the gateway. Cleared while unicast
+    /// flows so the first heartbeat of an idle gap fires at the arm
+    /// threshold, not a full interval later.
+    pub last_heartbeat: Option<SmolInstant>,
     /// Timing knobs for the rx watchdog.
     pub watchdog: WatchdogThresholds,
     /// How long a full tx path may hold undrained spill before the conn is
