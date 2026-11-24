@@ -223,6 +223,8 @@ pub fn service(state: &mut NetState, id: u64) -> bool {
     // Graceful close that never completed: the FIN sits in a socket the
     // wedged remote will not drain, so the entry would leak. Abort past
     // the deadline; a healthy close reaches Closed and never gets here.
+    // send_result keeps the owed-reply contract if a future path makes
+    // this reachable pre-establishment (no-op for established conns).
     if conn.close_deadline.is_some_and(|d| SmolInstant::now() > d) {
         log::warn!(
             "conn {} close never drained: remote path wedged, aborting",
@@ -232,6 +234,7 @@ pub fn service(state: &mut NetState, id: u64) -> bool {
         conn.rx_pipe.close();
         conn.tx_pipe.close();
         let _ = state.sockets.remove(conn.handle);
+        send_result(conn, ConnectResult::Refused);
         return true;
     }
     false
@@ -254,6 +257,10 @@ pub fn handle_close(state: &mut NetState, id: u64) {
         // spill stall bounds this graceful phase.
         conn.close_deadline = Some(SmolInstant::now() + CLOSE_TIMEOUT);
     } else {
+        // A Close can race the handshake: the result is still owed and
+        // must reach the caller as Refused, not a channel drop. No-op
+        // for conns whose result was already delivered.
+        send_result(conn, ConnectResult::Refused);
         sock.abort();
         conn.rx_pipe.close();
         conn.tx_pipe.close();
@@ -494,7 +501,29 @@ mod tests {
         // and removes the entry; no deadline can stray on a healthy close.
         handle_close(&mut state, id);
         assert!(!state.tcp_conns.contains_key(&id));
-        // The close path owed no result: nothing to deliver either way.
-        assert!(resp_rx.try_recv().is_err());
+        // Result was never delivered (no handshake): the close must still
+        // answer the owed connect reply with Refused, not strand it.
+        let refused = resp_rx.recv_timeout(std::time::Duration::from_secs(1)).ok();
+        assert!(
+            matches!(refused, Some(ConnectResult::Refused)),
+            "close racing a pending connect must deliver Refused"
+        );
+    }
+
+    #[test]
+    fn close_racing_pending_connect_delivers_refused() {
+        let mut state = test_state(true);
+        let (id, resp_rx) = wedged_conn(&mut state, 0);
+        // reproduce the race: established=false, result still owed
+        state.tcp_conns.get_mut(&id).unwrap().established = false;
+
+        handle_close(&mut state, id);
+
+        assert!(!state.tcp_conns.contains_key(&id));
+        let refused = resp_rx.recv_timeout(std::time::Duration::from_secs(1)).ok();
+        assert!(
+            matches!(refused, Some(ConnectResult::Refused)),
+            "the owed reply must reach the caller, not a channel drop"
+        );
     }
 }

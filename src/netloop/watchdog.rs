@@ -176,6 +176,12 @@ pub fn heartbeat(state: &mut NetState) {
         state.heartbeat_unanswered = 0;
         return;
     }
+    // The one-pass claim above needs the probe cadence slower than the
+    // unicast threshold; faster heartbeats keep silence permanently under
+    // the threshold and the phase resets every pass (the 20s-cadence
+    // regression back through config). Defaults hold; the e2e tuning
+    // shortens both together.
+    debug_assert!(th.heartbeat >= th.unicast_silence);
     let due = match state.last_heartbeat {
         Some(t) => now - t >= th.heartbeat,
         None => true,
