@@ -189,6 +189,9 @@ fn run(
         gateway: None,
         last_rx: SmolInstant::now(),
         ever_rx: false,
+        last_unicast_rx: SmolInstant::now(),
+        ever_unicast_rx: false,
+        demand_pending: false,
         probe_started: None,
         last_watchdog_log: None,
         probe_socket: None,
@@ -281,6 +284,7 @@ fn run(
         }
 
         let rx_before = state.dev.rx_taken();
+        let uc_before = state.dev.rx_unicast();
         let _ = state
             .iface
             .poll(SmolInstant::now(), &mut state.dev, &mut state.sockets);
@@ -288,6 +292,15 @@ fn run(
             state.last_rx = SmolInstant::now();
             state.ever_rx = true;
         }
+        if state.dev.rx_unicast() > uc_before {
+            state.last_unicast_rx = SmolInstant::now();
+            state.ever_unicast_rx = true;
+        }
+
+        // Demand for the vmnet path: a DNS query in flight or a TCP connect
+        // still establishing. Unicast silence matters when answers are due.
+        state.demand_pending =
+            !state.dns_pending.is_empty() || state.tcp_conns.values().any(|c| !c.established);
 
         dhcp::service(&mut state);
         dns::service(&mut state);

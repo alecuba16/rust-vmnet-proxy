@@ -63,6 +63,17 @@ pub struct NetState<'a> {
     /// Set once any inbound frame arrives; a LAN that is silent even while
     /// healthy would keep the watchdog permanently armed, so it disarms.
     pub ever_rx: bool,
+    /// Smoltcp Instant of the last unicast frame for our MAC. Bridged-mode
+    /// wedges can pass multicast while unicast forwarding is dead, so the
+    /// watchdog tracks unicast silence separately from total silence.
+    pub last_unicast_rx: SmolInstant,
+    /// Set once any unicast frame arrives; the unicast arm of the watchdog
+    /// needs a healthy-unicast baseline before it can declare a wedge.
+    pub ever_unicast_rx: bool,
+    /// True when traffic is waiting on the vmnet path: a pending DNS query
+    /// or a TCP connection still establishing. Unicast silence only counts
+    /// as a wedge when something is actually waiting for an answer.
+    pub demand_pending: bool,
     /// Probe window start when rx went silent while online and the gateway
     /// is known.
     pub probe_started: Option<SmolInstant>,

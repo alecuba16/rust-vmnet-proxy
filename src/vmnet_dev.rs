@@ -24,9 +24,13 @@ pub struct VmnetDevice {
     /// before any new framed message; never re-prefixed.
     tx_residual: Vec<u8>,
     local_mac: [u8; 6],
-    /// Frames handed to smoltcp since boot; the rx watchdog samples it
-    /// around iface.poll() to see if anything arrived.
+    /// Frames handed to smoltcp since boot, after the MAC filter. The rx
+    /// watchdog samples it around iface.poll() to see if anything arrived.
     rx_taken: u64,
+    /// Unicast frames for our MAC only. Bridged-mode wedges can pass
+    /// multicast (ARP, mDNS) while the router stops forwarding our unicast,
+    /// so the watchdog needs a unicast-only signal.
+    rx_unicast: u64,
 }
 
 pub struct PhysRxToken {
@@ -71,6 +75,7 @@ impl VmnetDevice {
             tx_residual: Vec::new(),
             local_mac,
             rx_taken: 0,
+            rx_unicast: 0,
         })
     }
 
@@ -86,6 +91,11 @@ impl VmnetDevice {
     /// watchdog samples this counter around iface.poll().
     pub fn rx_taken(&self) -> u64 {
         self.rx_taken
+    }
+
+    /// Unicast frames for our MAC since boot, after the MAC filter.
+    pub fn rx_unicast(&self) -> u64 {
+        self.rx_unicast
     }
 
     /// Pull every complete frame currently readable from the daemon socket.
@@ -216,6 +226,9 @@ impl Device for VmnetDevice {
             let multicast = dst[0] & 1 == 1;
             if dst != self.local_mac && !multicast {
                 continue;
+            }
+            if dst == self.local_mac {
+                self.rx_unicast += 1;
             }
             self.rx_taken += 1;
             let rx = PhysRxToken { frame };

@@ -13,56 +13,80 @@ use crate::netloop::state::NetState;
 /// also means fill_rx() never errors, so the netloop's own exit path never
 /// fires.
 ///
-/// Signal: no frame passes the MAC filter for WATCHDOG_SILENCE while online.
-/// On a bridged LAN multicast chatter (ARP, mDNS) never stops, so sustained
-/// silence means frames are not reaching us. Confirm with a gateway probe:
-/// an outbound UDP packet forces neighbor discovery, which sends ARP for the
-/// gateway; zero inbound frames for the whole probe window means the rx
-/// path is dead. Returning true exits the netloop, and launchd KeepAlive
-/// restarts the proxy, which re-wedges the daemon flood registration via a
-/// fresh unix connection (verified recovery path in the field).
+/// Two wedges, two arms:
+///
+/// 1. Total silence: no frame at all passes the MAC filter while online.
+///    On a bridged LAN multicast chatter (ARP, mDNS) never stops, so
+///    sustained total silence means the daemon socket itself stopped
+///    delivering.
+///
+/// 2. Unicast silence (lima-vm/socket_vmnet#130 class): multicast keeps
+///    flowing but the router/bridge stops forwarding unicast to our MAC, so
+///    DNS replies, SYN-ACKs and ARP replies to our own requests never
+///    arrive while broadcasts keep arm 1 disarmed. This arm needs demand:
+///    a pending DNS query or an establishing TCP connection whose answer is
+///    overdue.
+///
+/// Both arms confirm with a gateway probe: an outbound UDP packet forces
+/// neighbor discovery, which sends ARP for the gateway. Zero unicast frames
+/// for the whole probe window means the rx path is dead. Returning true exits
+/// the netloop, and launchd KeepAlive restarts the proxy, which re-wedges the
+/// daemon flood registration via a fresh unix connection (verified recovery
+/// path in the field).
 ///
 /// False-positive guards:
 /// - offline (no lease): DHCP retries handle recovery, silence is expected
 /// - never received anything since boot: the LAN may legitimately be quiet
-/// - any inbound frame during the window disarms everything
+/// - unicast arm: no unicast baseline, or nothing waiting for an answer
+/// - any inbound frame during the window disarms arm 1; unicast frame disarms
+///   arm 2 (a broadcast cannot heal a unicast wedge)
 ///
 /// Returns true when the netloop should exit.
 pub fn check(state: &mut NetState) -> bool {
     let now = SmolInstant::now();
     let silent_for = now - state.last_rx;
+    let uc_silent_for = now - state.last_unicast_rx;
 
-    if !state.online || silent_for < WATCHDOG_SILENCE {
-        disarm(state);
-        return false;
-    }
+    let total_wedged = state.online && state.ever_rx && silent_for >= WATCHDOG_SILENCE;
+    let unicast_wedged = state.online
+        && state.ever_unicast_rx
+        && uc_silent_for >= WATCHDOG_UNICAST_SILENCE
+        && state.demand_pending;
 
-    // A LAN that has been silent since boot: no baseline for "wedge", the
-    // probe would arm forever on a quiet-but-healthy network.
-    if !state.ever_rx {
+    if !total_wedged && !unicast_wedged {
         disarm(state);
         return false;
     }
 
     let Some(gateway) = state.gateway else {
+        let (kind, gap) = if unicast_wedged {
+            ("unicast rx", uc_silent_for)
+        } else {
+            ("rx", silent_for)
+        };
         warn_once(
             state,
             now,
             format!(
-                "rx silent for {}s while online with no gateway on the lease; waiting",
-                silent_for.secs()
+                "{kind} silent for {}s while online with no gateway on the lease; waiting",
+                gap.secs()
             ),
         );
         return false;
     };
 
     if state.probe_started.is_none() {
+        let (kind, gap) = if unicast_wedged {
+            ("unicast rx", uc_silent_for)
+        } else {
+            ("rx", silent_for)
+        };
         warn_once(
             state,
             now,
             format!(
-                "rx silent for {}s while online; probing gateway {}",
-                silent_for.secs(),
+                "{kind} silent for {}s while online; probing gateway {}",
+                gap.secs(),
                 gateway
             ),
         );
@@ -79,9 +103,14 @@ pub fn check(state: &mut NetState) -> bool {
         return false;
     }
 
+    let (kind, gap) = if unicast_wedged {
+        ("unicast rx", uc_silent_for)
+    } else {
+        ("rx", silent_for)
+    };
     log::error!(
-        "vmnet rx wedged: {}s silence while online, gateway {} never answered within {}s; exiting for supervisor restart",
-        silent_for.secs(),
+        "vmnet {kind} wedged: {}s silence while online, gateway {} never answered within {}s; exiting for supervisor restart",
+        gap.secs(),
         gateway,
         WATCHDOG_PROBE_WINDOW.secs(),
     );
@@ -148,6 +177,7 @@ fn warn_once(state: &mut NetState, now: SmolInstant, msg: String) {
 }
 
 const WATCHDOG_SILENCE: SmolDuration = SmolDuration::from_secs(45);
+const WATCHDOG_UNICAST_SILENCE: SmolDuration = SmolDuration::from_secs(20);
 const WATCHDOG_PROBE_WINDOW: SmolDuration = SmolDuration::from_secs(15);
 const WATCHDOG_LOG_INTERVAL: SmolDuration = SmolDuration::from_secs(30);
 
@@ -209,6 +239,9 @@ mod tests {
             gateway: None,
             last_rx: SmolInstant::now(),
             ever_rx: false,
+            last_unicast_rx: SmolInstant::now(),
+            ever_unicast_rx: false,
+            demand_pending: false,
             probe_started: None,
             last_watchdog_log: None,
             probe_socket: None,
@@ -277,5 +310,96 @@ mod tests {
         state.last_rx = SmolInstant::now() - SmolDuration::from_secs(120);
         state.probe_started = Some(SmolInstant::now() - SmolDuration::from_secs(5));
         assert!(!check(&mut state));
+    }
+
+    #[test]
+    fn unicast_wedge_with_demand_arms_probe() {
+        // The #130 wedge: broadcasts keep arriving (last_rx fresh) but the
+        // router stopped forwarding unicast. Pending DNS makes it a wedge.
+        let mut state = test_state(true);
+        state.ever_rx = true;
+        state.ever_unicast_rx = true;
+        state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
+        state.last_rx = SmolInstant::now(); // broadcast traffic still flows
+        state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(60);
+        state.demand_pending = true;
+        assert!(!check(&mut state)); // arms the probe, does not exit yet
+        assert!(state.probe_started.is_some());
+        assert!(state.probe_socket.is_some());
+    }
+
+    #[test]
+    fn unicast_wedge_without_demand_disarms() {
+        // Unicast silent but nothing waits for an answer: idle, not wedged.
+        let mut state = test_state(true);
+        state.ever_rx = true;
+        state.ever_unicast_rx = true;
+        state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
+        state.last_rx = SmolInstant::now();
+        state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(60);
+        state.demand_pending = false;
+        assert!(!check(&mut state));
+        assert!(state.probe_started.is_none());
+    }
+
+    #[test]
+    fn broadcast_only_traffic_does_not_disarm_unicast_probe() {
+        // Once the unicast arm is probing, a broadcast must not reset it:
+        // the netloop only refreshes last_unicast_rx on unicast frames.
+        let mut state = test_state(true);
+        state.ever_rx = true;
+        state.ever_unicast_rx = true;
+        state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
+        state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(60);
+        state.demand_pending = true;
+        assert!(!check(&mut state));
+        assert!(state.probe_started.is_some());
+
+        state.last_rx = SmolInstant::now(); // only broadcasts arrived
+        assert!(!check(&mut state));
+        assert!(state.probe_started.is_some());
+    }
+
+    #[test]
+    fn unicast_frame_disarms_unicast_probe() {
+        let mut state = test_state(true);
+        state.ever_rx = true;
+        state.ever_unicast_rx = true;
+        state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
+        state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(60);
+        state.demand_pending = true;
+        assert!(!check(&mut state));
+        assert!(state.probe_started.is_some());
+
+        state.last_unicast_rx = SmolInstant::now(); // unicast came back
+        assert!(!check(&mut state));
+        assert!(state.probe_started.is_none());
+        assert!(state.probe_socket.is_none());
+    }
+
+    #[test]
+    fn unicast_wedge_orders_exit_after_probe_window() {
+        let mut state = test_state(true);
+        state.ever_rx = true;
+        state.ever_unicast_rx = true;
+        state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
+        state.last_rx = SmolInstant::now();
+        state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(120);
+        state.demand_pending = true;
+        state.probe_started = Some(SmolInstant::now() - SmolDuration::from_secs(16));
+        assert!(check(&mut state));
+    }
+
+    #[test]
+    fn unicast_no_baseline_disarms_even_with_demand() {
+        // Never got unicast since boot: no baseline for a unicast wedge.
+        let mut state = test_state(true);
+        state.ever_rx = true;
+        state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
+        state.last_rx = SmolInstant::now();
+        state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(120);
+        state.demand_pending = true;
+        assert!(!check(&mut state));
+        assert!(state.probe_started.is_none());
     }
 }
