@@ -140,6 +140,12 @@ pub struct NetState<'a> {
     /// UDP socket used to force ARP for the gateway while the probe window
     /// runs; removed on disarm.
     pub probe_socket: Option<SocketHandle>,
+    /// UDP socket for the heartbeat's own probes. Lives as long as the
+    /// heartbeat phase: queued packets must survive to the next poll,
+    /// so only a phase end (silence broken, offline, gateway change)
+    /// removes it. Separate from probe_socket so disarm() cannot drop a
+    /// queued heartbeat packet mid-pass (the 0.2.6 probe storm).
+    pub heartbeat_socket: Option<SocketHandle>,
     /// When the heartbeat last probed the gateway. Cleared while unicast
     /// flows so the first heartbeat of an idle gap fires at the arm
     /// threshold, not a full interval later.

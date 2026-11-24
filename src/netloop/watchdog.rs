@@ -88,7 +88,7 @@ pub fn check(state: &mut NetState) -> bool {
     // Re-probe every pass while the window runs: neighbor discovery is
     // rate limited by the neighbor cache, and a lost ARP must not end
     // the window on a technicality.
-    probe_gateway(state, gateway);
+    probe_gateway(state, gateway, ProbeSlot::Watchdog);
 
     let probed_for = now - state.probe_started.expect("armed above");
     if probed_for < th.probe_window {
@@ -128,17 +128,17 @@ pub fn check(state: &mut NetState) -> bool {
     true
 }
 
-/// Drop probe state; called on every healthy pass and on disarm events.
-/// The heartbeat arms probe_socket without touching probe_started, so the
-/// socket is taken unconditionally: the heartbeat re-creates it on demand.
+/// Drop the probe-window state; called on every healthy pass. This must
+/// NOT touch the heartbeat's phase or socket: the netloop pass order runs
+/// heartbeat() (queues the probe packet) after check() in the same pass,
+/// and reclaiming the socket here drops the queued packet before the next
+/// poll ever transmits it (observed live in 0.2.6: probe storm at pass
+/// cadence, nothing on the wire, heartbeat knob dead). The heartbeat owns
+/// its socket and ends its own phase on silence-broken/offline/no-gateway.
 fn disarm(state: &mut NetState) {
     state.probe_started = None;
     if let Some(h) = state.probe_socket.take() {
         let _ = state.sockets.remove(h);
-    }
-    if state.last_heartbeat.is_some() {
-        state.heartbeat_unanswered = 0;
-        state.last_heartbeat = None;
     }
 }
 
@@ -154,26 +154,27 @@ fn disarm(state: &mut NetState) {
 /// refreshes; it only restarts when genuine traffic (client unicast) breaks
 /// the silence for real. Unanswered probes escalate visibility one WARN at
 /// a time so a demand-less half wedge stays visible in the log.
+///
+/// The heartbeat socket survives healthy passes: disarm() must not reclaim
+/// it, or the queued packet dies with the socket before the next poll (the
+/// 0.2.6 probe storm). Phase ends here close the socket and clear the debt.
 pub fn heartbeat(state: &mut NetState) {
     if !state.online || state.gateway.is_none() {
-        state.last_heartbeat = None;
-        state.heartbeat_unanswered = 0;
+        end_heartbeat_phase(state);
         return;
     }
     let now = SmolInstant::now();
     let uc_silent_for = now - state.last_unicast_rx;
     let th = state.watchdog;
     if th.heartbeat == SmolDuration::ZERO || !state.ever_unicast_rx {
-        state.last_heartbeat = None;
-        state.heartbeat_unanswered = 0;
+        end_heartbeat_phase(state);
         return;
     }
     if uc_silent_for < th.unicast_silence {
         // Silence is genuinely broken (client unicast, not our own probe
         // reply: a probe reply would keep silence just under the threshold
         // for one pass at most). Restart the heartbeat phase.
-        state.last_heartbeat = None;
-        state.heartbeat_unanswered = 0;
+        end_heartbeat_phase(state);
         return;
     }
     // The one-pass claim above needs the probe cadence slower than the
@@ -187,7 +188,11 @@ pub fn heartbeat(state: &mut NetState) {
         None => true,
     };
     if due {
-        probe_gateway(state, state.gateway.expect("checked above"));
+        probe_gateway(
+            state,
+            state.gateway.expect("checked above"),
+            ProbeSlot::Heartbeat,
+        );
         state.last_heartbeat = Some(now);
         state.heartbeat_unanswered += 1;
         if state.heartbeat_unanswered > 1 {
@@ -206,11 +211,21 @@ pub fn heartbeat(state: &mut NetState) {
     }
 }
 
+/// Close out a heartbeat phase: drop the probe socket (its queued packet,
+/// if any, is no longer wanted) and clear the unanswered debt.
+fn end_heartbeat_phase(state: &mut NetState) {
+    state.last_heartbeat = None;
+    state.heartbeat_unanswered = 0;
+    if let Some(h) = state.heartbeat_socket.take() {
+        let _ = state.sockets.remove(h);
+    }
+}
+
 /// Force neighbor discovery for the gateway right after a lease lands, so a
 /// renewal cycle cannot leave the unicast path riding on a stale neighbor
 /// entry (observed: blackouts begin seconds after Configured).
 pub fn refresh_gateway(state: &mut NetState, gateway: smoltcp::wire::Ipv4Address) {
-    probe_gateway(state, gateway);
+    probe_gateway(state, gateway, ProbeSlot::Heartbeat);
     state.last_heartbeat = None;
     state.heartbeat_unanswered = 0;
 }
@@ -219,12 +234,18 @@ pub fn refresh_gateway(state: &mut NetState, gateway: smoltcp::wire::Ipv4Address
 /// fixed nonzero port works: smoltcp has no conflict check within the set.
 const PROBE_LOCAL_PORT: u16 = 41111;
 
-/// Queue a one-byte UDP packet to the gateway on the persistent probe
-/// socket. Egress neighbor discovery emits ARP for the gateway MAC (rate
-/// limited by the neighbor cache to one request per second); any inbound
-/// frame, including the ARP reply, resets last_rx on the next pass.
-fn probe_gateway(state: &mut NetState, gateway: smoltcp::wire::Ipv4Address) {
-    if state.probe_socket.is_none() {
+/// Queue a one-byte UDP packet to the gateway on the probe socket. Two
+/// owners share this helper: check()'s probe window (probe_socket) and the
+/// heartbeat cadence (heartbeat_socket). Each keeps its own persistent
+/// socket so packets queued this pass actually transmit on the next poll;
+/// reclaiming a socket in the same pass it was queued (what disarm did in
+/// 0.2.6) drops the packet and storms ARP at pass cadence.
+fn probe_gateway(state: &mut NetState, gateway: smoltcp::wire::Ipv4Address, slot: ProbeSlot) {
+    let handle_slot = match slot {
+        ProbeSlot::Watchdog => &mut state.probe_socket,
+        ProbeSlot::Heartbeat => &mut state.heartbeat_socket,
+    };
+    if handle_slot.is_none() {
         let mut sock = smoltcp::socket::udp::Socket::new(
             smoltcp::socket::udp::PacketBuffer::new(
                 vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 1],
@@ -238,9 +259,9 @@ fn probe_gateway(state: &mut NetState, gateway: smoltcp::wire::Ipv4Address) {
         if sock.bind(PROBE_LOCAL_PORT).is_err() {
             return;
         }
-        state.probe_socket = Some(state.sockets.add(sock));
+        *handle_slot = Some(state.sockets.add(sock));
     }
-    let Some(h) = state.probe_socket else {
+    let Some(h) = *handle_slot else {
         return;
     };
     let sock = state.sockets.get_mut::<smoltcp::socket::udp::Socket>(h);
@@ -250,6 +271,12 @@ fn probe_gateway(state: &mut NetState, gateway: smoltcp::wire::Ipv4Address) {
             smoltcp::wire::IpEndpoint::new(IpAddress::Ipv4(gateway), 9),
         );
     }
+}
+
+#[derive(Clone, Copy)]
+enum ProbeSlot {
+    Watchdog,
+    Heartbeat,
 }
 
 /// Warn at most once per WATCHDOG_LOG_INTERVAL so long outages do not spam
@@ -439,7 +466,7 @@ mod tests {
         state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(30);
         state.demand_pending = false;
         heartbeat(&mut state);
-        assert!(state.probe_socket.is_some(), "heartbeat armed no probe");
+        assert!(state.heartbeat_socket.is_some(), "heartbeat armed no probe");
         assert!(state.last_heartbeat.is_some());
         assert!(
             state.probe_started.is_none(),
@@ -542,25 +569,34 @@ mod tests {
     }
 
     #[test]
-    fn disarm_reclaims_heartbeat_probe_socket() {
-        // The heartbeat arms probe_socket without probe_started; disarm on
-        // a healthy pass must still reclaim the socket, not leak it into
-        // every future iface.poll walk.
+    fn disarm_keeps_heartbeat_socket_and_phase() {
+        // The 0.2.6 regression this guards: disarm ran after heartbeat in
+        // the same pass and reclaimed the socket, dropping the queued
+        // packet before any poll could transmit it. The phase and socket
+        // must survive healthy passes; only heartbeat() ends its phase.
         let mut state = test_state(true);
         state.ever_unicast_rx = true;
         state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
         state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(30);
         heartbeat(&mut state);
-        assert!(state.probe_socket.is_some());
+        assert!(state.heartbeat_socket.is_some());
         assert!(state.probe_started.is_none());
 
-        state.last_unicast_rx = SmolInstant::now(); // traffic resumed
-                                                    // disarm runs from check() on a healthy pass
+        // healthy pass: silence below the unicast threshold, disarm runs
+        state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(5);
         assert!(!check(&mut state));
         assert!(
-            state.probe_socket.is_none(),
-            "disarm leaked the heartbeat socket"
+            state.heartbeat_socket.is_some(),
+            "disarm must not reclaim the heartbeat socket mid-phase"
         );
+        assert_eq!(state.heartbeat_unanswered, 1);
+        assert!(state.last_heartbeat.is_some());
+
+        // silence broken for real: heartbeat ends its own phase and
+        // reclaims the socket
+        state.last_unicast_rx = SmolInstant::now();
+        heartbeat(&mut state);
+        assert!(state.heartbeat_socket.is_none());
         assert_eq!(state.heartbeat_unanswered, 0);
         assert!(state.last_heartbeat.is_none());
     }
@@ -571,7 +607,7 @@ mod tests {
         state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
         state.last_heartbeat = Some(SmolInstant::now());
         refresh_gateway(&mut state, Ipv4Address::new(192, 168, 1, 1));
-        assert!(state.probe_socket.is_some(), "lease probe armed no ARP");
+        assert!(state.heartbeat_socket.is_some(), "lease probe armed no ARP");
         assert!(state.last_heartbeat.is_none());
     }
 }

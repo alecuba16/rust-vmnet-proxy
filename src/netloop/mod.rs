@@ -330,6 +330,7 @@ fn run(mut dev: VmnetDevice, fds: LoopFds, cmd_rx: Receiver<NetCmd>, cfg: LoopCf
         probe_started: None,
         last_watchdog_log: None,
         probe_socket: None,
+        heartbeat_socket: None,
         last_heartbeat: None,
         heartbeat_unanswered: 0,
         watchdog,
