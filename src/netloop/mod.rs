@@ -333,6 +333,7 @@ fn run(mut dev: VmnetDevice, fds: LoopFds, cmd_rx: Receiver<NetCmd>, cfg: LoopCf
         heartbeat_socket: None,
         last_heartbeat: None,
         heartbeat_unanswered: 0,
+        heartbeat_reply_rx: None,
         watchdog,
         tx_stall: SmolDuration::from_secs(30),
     };

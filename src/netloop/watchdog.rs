@@ -185,7 +185,11 @@ pub fn heartbeat(state: &mut NetState) {
         // pass later, which is the accepted cost.
         if state.heartbeat_unanswered > 0 {
             state.heartbeat_unanswered = 0;
-        } else {
+            state.heartbeat_reply_rx = Some(state.last_unicast_rx);
+        } else if state
+            .heartbeat_reply_rx
+            .is_none_or(|t| state.last_unicast_rx > t)
+        {
             end_heartbeat_phase(state);
         }
         return;
@@ -228,6 +232,7 @@ pub fn heartbeat(state: &mut NetState) {
 fn end_heartbeat_phase(state: &mut NetState) {
     state.last_heartbeat = None;
     state.heartbeat_unanswered = 0;
+    state.heartbeat_reply_rx = None;
     if let Some(h) = state.heartbeat_socket.take() {
         let _ = state.sockets.remove(h);
     }
@@ -248,6 +253,7 @@ pub fn refresh_gateway(state: &mut NetState, gateway: smoltcp::wire::Ipv4Address
     probe_gateway(state, gateway, ProbeSlot::Heartbeat);
     state.last_heartbeat = None;
     state.heartbeat_unanswered = 1;
+    state.heartbeat_reply_rx = None;
 }
 
 /// Local port for the probe socket; bind(0) is rejected by smoltcp, and any
@@ -558,10 +564,30 @@ mod tests {
             "probe reply must not reset the 60s clock"
         );
 
+        // The live trap: heartbeat() runs every pass, but last_unicast_rx
+        // only changes when a NEW frame arrives. The same refresh is
+        // re-presented pass after pass; classifying it as genuine traffic
+        // here ended the phase one pass after the debt was paid and pinned
+        // the cadence back to 20s (observed live in 0.2.8). The snapshot
+        // must hold the phase through the re-presented refresh.
+        heartbeat(&mut state);
+        assert_eq!(
+            state.last_heartbeat,
+            Some(first),
+            "re-presented refresh must not end the phase"
+        );
+        assert!(state.heartbeat_socket.is_some(), "socket survives");
+        heartbeat(&mut state);
+        assert_eq!(
+            state.last_heartbeat,
+            Some(first),
+            "and again on the pass after that"
+        );
+
         // Silence recrosses the threshold before the 60s interval elapsed
         // (e.g. 25s after the first heartbeat): the clock survived, so no
         // heartbeat fires. That is the fix: the phase only restarts on
-        // genuine client traffic with no probe outstanding.
+        // genuine client traffic, a refresh NEWER than the classified one.
         state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(30);
         heartbeat(&mut state);
         assert_eq!(
@@ -570,6 +596,14 @@ mod tests {
             "threshold recross must not fire a heartbeat"
         );
         assert_eq!(state.heartbeat_unanswered, 0, "nothing outstanding again");
+
+        // Genuine client traffic: a NEW refresh while no probe is
+        // outstanding. Only this ends the phase. (+1ms: Instant has
+        // microsecond resolution and consecutive now() calls can tie.)
+        state.last_unicast_rx = SmolInstant::now() + SmolDuration::from_millis(1);
+        heartbeat(&mut state);
+        assert_eq!(state.last_heartbeat, None, "genuine traffic ends phase");
+        assert!(state.heartbeat_socket.is_none(), "socket reclaimed");
 
         // Now the wedge case: silence sustained, gateway never answers.
         // Clock advanced past the interval: next heartbeat fires. Debt was
@@ -654,8 +688,16 @@ mod tests {
         assert_eq!(state.heartbeat_unanswered, 0);
         assert!(state.last_heartbeat.is_some());
 
-        // Sustained genuine traffic next pass, silence still broken: phase
-        // ends, socket reclaimed.
+        // Sustained genuine traffic: a NEW unicast frame next pass
+        // (fresh timestamp), silence still broken. Only a refresh newer
+        // than the classified reply ends the phase; re-presenting the
+        // classified refresh must not.
+        heartbeat(&mut state);
+        assert!(
+            state.last_heartbeat.is_some(),
+            "re-presented refresh must not end the phase"
+        );
+        state.last_unicast_rx = SmolInstant::now() + SmolDuration::from_millis(1);
         heartbeat(&mut state);
         assert_eq!(state.last_heartbeat, None, "genuine traffic ends phase");
         assert!(state.heartbeat_socket.is_none());

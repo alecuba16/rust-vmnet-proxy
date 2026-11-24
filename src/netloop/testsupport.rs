@@ -64,6 +64,7 @@ pub fn test_state(online: bool) -> NetState<'static> {
         heartbeat_socket: None,
         last_heartbeat: None,
         heartbeat_unanswered: 0,
+        heartbeat_reply_rx: None,
         watchdog: WatchdogThresholds::default(),
         tx_stall: SmolDuration::from_secs(30),
     }

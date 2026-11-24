@@ -154,6 +154,16 @@ pub struct NetState<'a> {
     /// Above 1 the gateway is not answering our idle probes: keep probing
     /// but make the half wedge visible in the log.
     pub heartbeat_unanswered: u32,
+    /// Snapshot of `last_unicast_rx` as of the unicast refresh that was
+    /// classified as a probe reply (debt paid). The netloop refreshes
+    /// `last_unicast_rx` once per frame, but heartbeat() runs every pass, so
+    /// the SAME refresh is presented repeatedly until the next frame: a bare
+    /// `unanswered == 0` check would classify the re-presented refresh as
+    /// genuine traffic and end the phase one pass after paying the debt (the
+    /// 0.2.8 live 20s cadence: fire, reply pays debt, next pass kills phase,
+    /// recross fires fresh 20s later). The phase only ends on a refresh NEWER
+    /// than the classified one.
+    pub heartbeat_reply_rx: Option<SmolInstant>,
     /// Timing knobs for the rx watchdog.
     pub watchdog: WatchdogThresholds,
     /// How long a full tx path may hold undrained spill before the conn is
