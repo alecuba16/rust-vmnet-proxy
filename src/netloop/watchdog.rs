@@ -82,7 +82,6 @@ pub fn check(state: &mut NetState) -> bool {
 
     if state.probe_started.is_none() {
         state.probe_started = Some(now);
-        state.last_heartbeat = None;
     }
 
     // Re-probe every pass while the window runs: neighbor discovery is
@@ -174,13 +173,16 @@ pub fn heartbeat(state: &mut NetState) {
     }
     if uc_silent_for < th.unicast_silence {
         // Unicast is flowing again. If a probe is outstanding, this frame is
-        // our own probe's ARP reply landing: pay the debt and KEEP the
-        // clock, or the phase resets here every interval and the heartbeat
-        // degenerates to unicast_silence cadence (observed live in 0.2.7:
-        // 20s probes despite a 60s knob). A refresh with no probe
-        // outstanding is genuine client traffic; only that ends the phase.
-        // Sustained client traffic while a probe happened to be in flight
-        // ends the phase one pass later, which is the accepted cost.
+        // the ARP reply to one of our probes landing (check()'s window probe
+        // included: a reply to that ARP proves gateway liveness just as
+        // well, so it pays the heartbeat's debt too; worst case it delays
+        // WARN escalation one interval). Pay the debt and KEEP the clock, or
+        // the phase resets here every interval and the heartbeat degenerates
+        // to unicast_silence cadence (observed live in 0.2.7: 20s probes
+        // despite a 60s knob). A refresh with no probe outstanding is
+        // genuine client traffic; only that ends the phase. Sustained client
+        // traffic while a probe happened to be in flight ends the phase one
+        // pass later, which is the accepted cost.
         if state.heartbeat_unanswered > 0 {
             state.heartbeat_unanswered = 0;
         } else {
@@ -234,10 +236,18 @@ fn end_heartbeat_phase(state: &mut NetState) {
 /// Force neighbor discovery for the gateway right after a lease lands, so a
 /// renewal cycle cannot leave the unicast path riding on a stale neighbor
 /// entry (observed: blackouts begin seconds after Configured).
+///
+/// The queued probe counts as outstanding debt from the moment it is
+/// queued: the DHCP exchange itself is unicast, so the same-pass heartbeat()
+/// typically sees silence already broken, and with no debt recorded it would
+/// classify the refresh as genuine traffic and reclaim the heartbeat socket
+/// before any poll transmits the packet (the 0.2.6 storm-class kill, reached
+/// through the lease path). The reply then lands as a normal heartbeat
+/// reply: debt paid, clock armed.
 pub fn refresh_gateway(state: &mut NetState, gateway: smoltcp::wire::Ipv4Address) {
     probe_gateway(state, gateway, ProbeSlot::Heartbeat);
     state.last_heartbeat = None;
-    state.heartbeat_unanswered = 0;
+    state.heartbeat_unanswered = 1;
 }
 
 /// Local port for the probe socket; bind(0) is rejected by smoltcp, and any
@@ -622,6 +632,89 @@ mod tests {
         assert!(state.heartbeat_socket.is_none());
         assert_eq!(state.heartbeat_unanswered, 0);
         assert!(state.last_heartbeat.is_none());
+    }
+
+    #[test]
+    fn heartbeat_genuine_traffic_after_paid_probe_ends_phase_next_pass() {
+        // The accepted cost, pinned: a probe fires, its reply pays the debt,
+        // then genuine client traffic lands while no probe is outstanding.
+        // The refresh with unanswered == 0 must end the phase and reclaim the
+        // socket, so the next idle gap starts a fresh heartbeat phase instead
+        // of inheriting a dead clock.
+        let mut state = test_state(true);
+        state.ever_unicast_rx = true;
+        state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
+        state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(30);
+        heartbeat(&mut state);
+        assert_eq!(state.heartbeat_unanswered, 1);
+
+        // Probe reply lands: debt paid, clock kept.
+        state.last_unicast_rx = SmolInstant::now();
+        heartbeat(&mut state);
+        assert_eq!(state.heartbeat_unanswered, 0);
+        assert!(state.last_heartbeat.is_some());
+
+        // Sustained genuine traffic next pass, silence still broken: phase
+        // ends, socket reclaimed.
+        heartbeat(&mut state);
+        assert_eq!(state.last_heartbeat, None, "genuine traffic ends phase");
+        assert!(state.heartbeat_socket.is_none());
+        assert_eq!(state.heartbeat_unanswered, 0);
+    }
+
+    #[test]
+    fn refresh_gateway_probe_survives_same_pass_heartbeat_with_fresh_unicast() {
+        // The DHCP lease path: refresh_gateway queues the forced neighbor
+        // discovery, and the lease exchange itself keeps unicast fresh, so
+        // the same-pass heartbeat() takes the silence-broken branch. The
+        // queued probe counts as outstanding debt, or heartbeat() reclaims
+        // the socket before any poll transmits it (the 0.2.6 storm-class
+        // kill reached through the lease path).
+        let mut state = test_state(true);
+        state.ever_unicast_rx = true;
+        state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
+        state.last_unicast_rx = SmolInstant::now(); // lease exchange just landed
+        refresh_gateway(&mut state, Ipv4Address::new(192, 168, 1, 1));
+        assert!(state.heartbeat_socket.is_some(), "lease probe queued");
+        assert_eq!(state.heartbeat_unanswered, 1, "probe counts as outstanding");
+
+        // Same-pass heartbeat with silence broken: debt paid, socket and
+        // packet survive to the next poll.
+        heartbeat(&mut state);
+        assert!(
+            state.heartbeat_socket.is_some(),
+            "queued lease probe must survive the same-pass heartbeat"
+        );
+        assert_eq!(state.heartbeat_unanswered, 0, "debt paid by the refresh");
+    }
+
+    #[test]
+    fn check_probe_reply_pays_heartbeat_debt() {
+        // Cross-mechanism semantics, pinned: check()'s window probe and the
+        // heartbeat share the same last_unicast_rx refresh, so the reply to
+        // check()'s ARP pays the heartbeat's outstanding debt just as a
+        // heartbeat reply would. A reply to either probe proves gateway
+        // liveness; WARN escalation stays honest because the debt only
+        // clears when some probe actually got answered.
+        let mut state = test_state(true);
+        state.ever_unicast_rx = true;
+        state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
+        state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(30);
+        heartbeat(&mut state);
+        assert_eq!(state.heartbeat_unanswered, 1);
+
+        // Demand wedge arms check()'s window and probes on the watchdog
+        // slot; its ARP reply lands as a unicast refresh.
+        state.demand_pending = true;
+        assert!(!check(&mut state));
+        assert!(state.probe_socket.is_some());
+        state.last_unicast_rx = SmolInstant::now();
+
+        // Heartbeat sees the refresh with a probe outstanding: debt paid,
+        // phase kept, no double probing out of the heartbeat slot.
+        heartbeat(&mut state);
+        assert_eq!(state.heartbeat_unanswered, 0, "check's reply pays the debt");
+        assert!(state.last_heartbeat.is_some(), "clock kept");
     }
 
     #[test]
