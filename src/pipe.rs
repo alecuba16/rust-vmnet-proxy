@@ -1,8 +1,25 @@
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-const PIPE_CAP: usize = 256 * 1024;
+/// Pipe capacity in bytes. Public for tests that need to fill a pipe.
+pub const PIPE_CAP: usize = 256 * 1024;
+
+/// Stall cap for `push_with_deadline`. MAX parks without a deadline (the
+/// splice tuning decides); an explicit instant bounds how long a full pipe
+/// may park the producer.
+#[derive(Clone, Copy)]
+pub enum Deadline {
+    Max,
+    At(Instant),
+}
+
+impl Deadline {
+    /// Deadline from now plus a Duration, the shape splice callers carry.
+    pub fn after(stall: Duration) -> Deadline {
+        Deadline::At(Instant::now() + stall)
+    }
+}
 
 struct PipeState {
     buf: VecDeque<u8>,
@@ -34,9 +51,32 @@ impl Pipe {
         }
     }
 
+    /// Non-blocking producer side for the netloop: take as much as fits,
+    /// leave the rest with the caller. Returns the bytes accepted.
+    pub fn try_push(&self, data: &[u8]) -> usize {
+        let mut st = self.state.lock().unwrap();
+        if st.closed {
+            return 0;
+        }
+        let room = PIPE_CAP - st.buf.len();
+        let n = room.min(data.len());
+        if n > 0 {
+            for b in &data[..n] {
+                st.buf.push_back(*b);
+            }
+            self.cv.notify_all();
+        }
+        n
+    }
+
     /// Producer side. Blocks until all of `data` fits or the pipe is closed.
-    /// Returns false if closed, meaning nothing was queued.
+    /// Returns false if closed, meaning nothing was queued. Parks without a
+    /// stall cap, matching the splice tuning.
     pub fn push(&self, data: &[u8]) -> bool {
+        self.push_with_deadline(data, Deadline::Max)
+    }
+
+    pub fn push_with_deadline(&self, data: &[u8], deadline: Deadline) -> bool {
         let mut st = self.state.lock().unwrap();
         let mut offset = 0;
         loop {
@@ -56,8 +96,19 @@ impl Pipe {
                     return true;
                 }
             }
-            // Full: wait until the consumer drains some bytes.
-            let (guard, _) = self.cv.wait_timeout(st, Duration::from_millis(50)).unwrap();
+            // Full: wait until the consumer drains some bytes or the stall
+            // deadline passes. A wedged remote then tears the conn down
+            // instead of parking the splice thread forever.
+            let (guard, _) = match deadline {
+                Deadline::Max => self.cv.wait_timeout(st, Duration::from_millis(50)).unwrap(),
+                Deadline::At(d) => {
+                    let now = std::time::Instant::now();
+                    if now >= d {
+                        return false;
+                    }
+                    self.cv.wait_timeout(st, d - now).unwrap()
+                }
+            };
             st = guard;
         }
     }

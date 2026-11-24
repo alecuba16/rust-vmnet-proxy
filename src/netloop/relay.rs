@@ -8,7 +8,7 @@ use smoltcp::wire::IpListenEndpoint;
 use crate::config::Relay;
 use crate::netloop::state::NetState;
 use crate::netloop::NetApi;
-use crate::pipe::Pipe;
+use crate::pipe::{Deadline, Pipe};
 
 /// Listeners pre-armed per relay. smoltcp 0.14 has no accept queue: the
 /// listening socket itself becomes the connection, so every accept needs a
@@ -114,6 +114,8 @@ pub fn service(state: &mut NetState, api: &NetApi, splice_timeout: std::time::Du
             remote,
             rx_pipe: Arc::clone(&rx_pipe),
             tx_pipe: Arc::clone(&tx_pipe),
+            tx_spill: Vec::new(),
+            tx_stuck_since: None,
             established: true,
             connect_deadline: None,
             result_tx: None,
@@ -160,6 +162,7 @@ fn spawn_forward(
     let handle = api.relay_handle(conn_id);
     let target = relay.target;
     let name = relay.name.clone();
+    let push_stall = std::time::Duration::from_secs(30);
     std::thread::Builder::new()
         .name(format!("relay-{name}"))
         .spawn(move || {
@@ -192,7 +195,9 @@ fn spawn_forward(
                                 // empty Write after a push: wakes the netloop
                                 // so the pipe drains this pass, not at the
                                 // next poll timeout
-                                if !up_tx.push(&buf[..n]) {
+                                if !up_tx.push_with_deadline(&buf[..n], Deadline::after(push_stall))
+                                {
+                                    up_handle.close();
                                     break;
                                 }
                                 up_handle.write(Vec::new());

@@ -156,6 +156,7 @@ fn main() {
     let socks_tuning = socks5::SocksTuning {
         accept_interval: tuning.accept_interval,
         splice_timeout: tuning.splice_timeout,
+        push_stall: std::time::Duration::from_secs(30),
     };
 
     let legs = sshlegs::spawn_legs(&cfg.ssh_legs);
@@ -192,14 +193,19 @@ fn main() {
         .spawn(move || socks5::serve(listener, socks_api, socks_tuning))
         .expect("spawn socks listener");
 
-    // Main waits: netloop exit (vmnet gone) or shutdown signal. The waiter
-    // thread consumes the JoinHandle; its liveness is the netloop liveness.
+    // Main waits: netloop exit (vmnet gone), netloop freeze (liveness
+    // stale beyond its published poll expectation), or shutdown signal.
+    // The join only fires on thread exit; a parked thread needs the
+    // liveness channel, because the in-loop rx watchdog shares the netloop
+    // failure domain and dies with it.
     let netloop_done = Arc::new(AtomicBool::new(false));
     let done_flag = Arc::clone(&netloop_done);
+    let liveness = Arc::clone(&net.liveness);
+    let netloop_join = net.join;
     std::thread::Builder::new()
         .name("netloop-waiter".into())
         .spawn(move || {
-            let _ = net.join.join();
+            let _ = netloop_join.join();
             done_flag.store(true, Ordering::SeqCst);
         })
         .expect("spawn waiter");
@@ -211,6 +217,11 @@ fn main() {
         }
         if netloop_done.load(Ordering::SeqCst) {
             log::error!("netloop exited");
+            legs.shutdown();
+            std::process::exit(1);
+        }
+        if liveness.is_dead(std::time::Duration::from_secs(10)) {
+            log::error!("netloop frozen: no loop pass beyond its expected poll sleep; exiting for supervisor restart");
             legs.shutdown();
             std::process::exit(1);
         }
