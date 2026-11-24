@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use smoltcp::iface::{Interface, SocketHandle, SocketSet};
 use smoltcp::socket::dns::QueryHandle;
-use smoltcp::time::Duration as SmolDuration;
+use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
 use smoltcp::wire::Ipv4Address;
 
 use crate::cmds::{ConnectResult, NetCmd};
@@ -52,4 +52,23 @@ pub struct NetState<'a> {
     pub online: bool,
     /// Cap for the poll_delay() timeout. None = uncapped (battery mode).
     pub poll_max: Option<SmolDuration>,
+    /// Default gateway from the DHCP lease; the watchdog probes it when rx
+    /// goes silent while online.
+    pub gateway: Option<Ipv4Address>,
+    /// Smoltcp Instant of the last frame that passed the MAC filter. On a
+    /// bridged LAN multicast (ARP, mDNS) never stops, so a long gap while
+    /// online means the vmnet rx path is wedged even though the unix socket
+    /// stays open.
+    pub last_rx: SmolInstant,
+    /// Set once any inbound frame arrives; a LAN that is silent even while
+    /// healthy would keep the watchdog permanently armed, so it disarms.
+    pub ever_rx: bool,
+    /// Probe window start when rx went silent while online and the gateway
+    /// is known.
+    pub probe_started: Option<SmolInstant>,
+    /// Rate limit for watchdog log lines during an ongoing outage.
+    pub last_watchdog_log: Option<SmolInstant>,
+    /// UDP socket used to force ARP for the gateway while the probe window
+    /// runs; removed on disarm.
+    pub probe_socket: Option<SocketHandle>,
 }

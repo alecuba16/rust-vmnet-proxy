@@ -24,6 +24,9 @@ pub struct VmnetDevice {
     /// before any new framed message; never re-prefixed.
     tx_residual: Vec<u8>,
     local_mac: [u8; 6],
+    /// Frames handed to smoltcp since boot; the rx watchdog samples it
+    /// around iface.poll() to see if anything arrived.
+    rx_taken: u64,
 }
 
 pub struct PhysRxToken {
@@ -67,6 +70,7 @@ impl VmnetDevice {
             tx_frames: VecDeque::new(),
             tx_residual: Vec::new(),
             local_mac,
+            rx_taken: 0,
         })
     }
 
@@ -76,6 +80,12 @@ impl VmnetDevice {
 
     pub fn raw_fd(&self) -> RawFd {
         self.stream.as_raw_fd()
+    }
+
+    /// Frames handed to smoltcp since boot, after the MAC filter. The rx
+    /// watchdog samples this counter around iface.poll().
+    pub fn rx_taken(&self) -> u64 {
+        self.rx_taken
     }
 
     /// Pull every complete frame currently readable from the daemon socket.
@@ -207,6 +217,7 @@ impl Device for VmnetDevice {
             if dst != self.local_mac && !multicast {
                 continue;
             }
+            self.rx_taken += 1;
             let rx = PhysRxToken { frame };
             let tx = PhysTxToken {
                 frames: &mut self.tx_frames,

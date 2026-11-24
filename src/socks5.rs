@@ -199,6 +199,7 @@ fn handle_client(mut client: TcpStream, api: NetApi, splice_timeout: Duration) {
         None => resolve(&api, &name),
     };
     let Some(ip) = ip else {
+        log::warn!("CONNECT {}:{}, DNS resolve failed", name, port);
         send_reply(&mut client, 0x04);
         return;
     };
@@ -215,6 +216,7 @@ fn handle_client(mut client: TcpStream, api: NetApi, splice_timeout: Duration) {
         return;
     }
     if !matches!(result, ConnectResult::Ok) {
+        log::warn!("CONNECT {}:{}, {}", name, port, result.describe());
         return;
     }
 

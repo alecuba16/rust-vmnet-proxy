@@ -3,6 +3,7 @@ pub mod dns;
 pub mod relay;
 pub mod state;
 pub mod tcp;
+pub mod watchdog;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -185,6 +186,12 @@ fn run(
         cmd_rx,
         online: false,
         poll_max: tuning.poll_max,
+        gateway: None,
+        last_rx: SmolInstant::now(),
+        ever_rx: false,
+        probe_started: None,
+        last_watchdog_log: None,
+        probe_socket: None,
     };
 
     if let Err(e) = relay::init(&mut state, &relays) {
@@ -273,13 +280,22 @@ fn run(
             return;
         }
 
+        let rx_before = state.dev.rx_taken();
         let _ = state
             .iface
             .poll(SmolInstant::now(), &mut state.dev, &mut state.sockets);
+        if state.dev.rx_taken() > rx_before {
+            state.last_rx = SmolInstant::now();
+            state.ever_rx = true;
+        }
 
         dhcp::service(&mut state);
         dns::service(&mut state);
         relay::service(&mut state, &api, tuning.splice_timeout);
+
+        if watchdog::check(&mut state) {
+            return;
+        }
 
         let ids: Vec<u64> = state.tcp_conns.keys().copied().collect();
         for id in ids {

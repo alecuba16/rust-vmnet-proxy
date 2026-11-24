@@ -23,8 +23,10 @@ pub fn service(state: &mut NetState) {
                 let _ = addrs.push(IpCidr::Ipv4(ip));
             });
             if let Some(router) = cfg.router {
+                state.gateway = Some(router);
                 let _ = state.iface.routes_mut().add_default_ipv4_route(router);
             } else {
+                state.gateway = None;
                 state.iface.routes_mut().remove_default_ipv4_route();
             }
             state.dns_servers = cfg.dns_servers.iter().copied().collect();
@@ -51,6 +53,11 @@ pub fn service(state: &mut NetState) {
         Some(dhcpv4::Event::Deconfigured) => {
             log::warn!("OFFLINE: DHCP lease lost");
             state.online = false;
+            state.gateway = None;
+            state.probe_started = None;
+            if let Some(h) = state.probe_socket.take() {
+                let _ = state.sockets.remove(h);
+            }
             state.iface.update_ip_addrs(|addrs| addrs.clear());
             state.iface.routes_mut().remove_default_ipv4_route();
             state.dns_servers.clear();

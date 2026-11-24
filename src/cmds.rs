@@ -47,6 +47,16 @@ impl ConnectResult {
             ConnectResult::Timeout => 0x06,
         }
     }
+
+    /// Human label for the log line; socks5 logs every failed CONNECT.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            ConnectResult::Ok => "connected",
+            ConnectResult::Refused => "refused",
+            ConnectResult::HostUnreachable => "host unreachable",
+            ConnectResult::Timeout => "connect timeout",
+        }
+    }
 }
 
 /// Handle given to a SOCKS client thread for one proxied TCP connection.
