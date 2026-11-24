@@ -333,7 +333,8 @@ impl Config {
             None => match env_cfg {
                 Some(p) => p.into(),
                 None => {
-                    let default = PathBuf::from(home.clone()).join(".config/rust-vmnet-proxy/config.yaml");
+                    let default =
+                        PathBuf::from(home.clone()).join(".config/rust-vmnet-proxy/config.yaml");
                     if default.exists() {
                         default
                     } else {

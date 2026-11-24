@@ -30,7 +30,11 @@ impl Sink {
     fn open(dir: &Path) -> Option<Sink> {
         std::fs::create_dir_all(dir).ok()?;
         let path = dir.join(LOG_FILE);
-        let file = OpenOptions::new().create(true).append(true).open(&path).ok()?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok()?;
         let (written, opened_at) = file
             .metadata()
             .and_then(|m| m.modified().map(|t| (m.len(), t)))
@@ -190,8 +194,7 @@ pub fn init(logging: &Logging) -> bool {
     sink.rotate_secs = logging.rotate_secs;
     sink.keep = logging.keep;
     sink.max_bytes = logging.max_bytes;
-    let mirror_stderr =
-        unsafe { libc::isatty(libc::STDERR_FILENO) == 1 } || sink.file.is_none();
+    let mirror_stderr = unsafe { libc::isatty(libc::STDERR_FILENO) == 1 } || sink.file.is_none();
     let logger = Logger {
         sink: Mutex::new(sink),
         level,
