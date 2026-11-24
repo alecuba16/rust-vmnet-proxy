@@ -172,32 +172,31 @@ pub fn heartbeat(state: &mut NetState) {
         return;
     }
     if uc_silent_for < th.unicast_silence {
-        // Unicast is flowing again. If a probe is outstanding, this frame is
-        // the ARP reply to one of our probes landing (check()'s window probe
-        // included: a reply to that ARP proves gateway liveness just as
-        // well, so it pays the heartbeat's debt too; worst case it delays
-        // WARN escalation one interval). Pay the debt and KEEP the clock, or
-        // the phase resets here every interval and the heartbeat degenerates
-        // to unicast_silence cadence (observed live in 0.2.7: 20s probes
-        // despite a 60s knob). A refresh with no probe outstanding is
-        // genuine client traffic; only a refresh strictly newer than the
-        // reply snapshot ends the phase, the same refresh re-presented pass
-        // after pass must not (observed live in 0.2.8: the pass right after
-        // the debt was paid classified the identical refresh as genuine
-        // traffic and pinned the cadence back to 20s). Sustained client
-        // traffic while a probe happened to be in flight ends the phase one
-        // pass later, which is the accepted cost. Second accepted cost:
-        // with two probes outstanding (reply latency >= heartbeat interval,
-        // a pathologically slow gateway), the second reply is strictly newer
-        // than the first reply's snapshot and ends the phase on our own
-        // probe; one off-cadence probe, self-limiting, no storm, no
-        // liveness loss.
-        if state.heartbeat_unanswered > 0 {
+        // Unicast is flowing again (data, ARP replies, or both). An ARP
+        // REPLY landing while a probe is outstanding is the answer to one
+        // of our probes (check()'s window probe included: a reply to that
+        // ARP proves gateway liveness just as well): pay the debt and KEEP
+        // the clock, or the phase resets here every interval and the
+        // heartbeat degenerates to unicast_silence cadence (observed live
+        // in 0.2.7: 20s probes despite a 60s knob). Replies must not end
+        // the phase: with the smoltcp neighbor TTL (60s) matching the
+        // default knob, every fire re-ARPs and its reply is a fresh
+        // unicast refresh; reading that as traffic killed each phase at
+        // its own fire and pinned the cadence to unicast_silence (observed
+        // live in 0.2.9: ~1.9 fires/min, phases dying same-second as the
+        // fire, no WARN). Only data unicast ends the phase, and only when
+        // strictly newer than the classified instant: the same-pass
+        // lease frames (refresh_gateway arms with the current instant)
+        // and the re-presented refresh of an already-classified frame must
+        // not (observed live in 0.2.8: the pass after the debt was paid
+        // classified the identical refresh as genuine traffic).
+        if state.heartbeat_unanswered > 0 && state.arp_reply_seen {
             state.heartbeat_unanswered = 0;
-            state.heartbeat_reply_rx = Some(state.last_unicast_rx);
-        } else if state
+            state.heartbeat_reply_rx = Some(now);
+        }
+        if state
             .heartbeat_reply_rx
-            .is_none_or(|t| state.last_unicast_rx > t)
+            .is_none_or(|t| state.last_data_rx > t)
         {
             end_heartbeat_phase(state);
         }
@@ -219,20 +218,14 @@ pub fn heartbeat(state: &mut NetState) {
             ProbeSlot::Heartbeat,
         );
         state.last_heartbeat = Some(now);
-        state.heartbeat_unanswered += 1;
-        if state.heartbeat_unanswered > 1 {
-            // The previous heartbeat's ARP reply never landed: only our own
-            // probes are keeping the unicast counter alive, if at all.
-            warn_once(
-                state,
-                now,
-                format!(
-                    "gateway {} silent across {} heartbeats while unicast idle",
-                    state.gateway.expect("checked above"),
-                    state.heartbeat_unanswered - 1
-                ),
-            );
-        }
+        // Debt accrues where the question hits the wire (the netloop's
+        // counters block samples the device's TX ARP counter around poll),
+        // not here: a fire whose neighbor entry is still valid queues a
+        // blind UDP:9 the gateway discards, asks no question, and must not
+        // accrue debt, or a healthy idle LAN WARNs on every other fire
+        // while the neighbor TTL and the heartbeat knob coincide (the
+        // 0.2.9 zero-WARN puzzle: live debt never exceeded 1 because
+        // blind fires, the majority, accrue nothing at all).
     }
 }
 
@@ -251,18 +244,19 @@ fn end_heartbeat_phase(state: &mut NetState) {
 /// renewal cycle cannot leave the unicast path riding on a stale neighbor
 /// entry (observed: blackouts begin seconds after Configured).
 ///
-/// The queued probe counts as outstanding debt from the moment it is
-/// queued: the DHCP exchange itself is unicast, so the same-pass heartbeat()
-/// typically sees silence already broken, and with no debt recorded it would
-/// classify the refresh as genuine traffic and reclaim the heartbeat socket
-/// before any poll transmits the packet (the 0.2.6 storm-class kill, reached
-/// through the lease path). The reply then lands as a normal heartbeat
-/// reply: debt paid, clock armed.
+/// The debt snapshot is the current instant, so the lease's own data frames
+/// (same pass or later) never read as newer and never end the phase. That
+/// snapshot alone is what keeps the same-pass heartbeat() from classifying
+/// the lease refresh as genuine traffic and reclaiming the heartbeat socket
+/// before any poll transmits the queued probe (the 0.2.6 storm-class kill,
+/// reached through the lease path). The probe's question accrues its debt
+/// honestly when it hits the wire on the next poll, and the reply then pays
+/// it like any heartbeat answer.
 pub fn refresh_gateway(state: &mut NetState, gateway: smoltcp::wire::Ipv4Address) {
+    state.dev.set_arp_target(gateway);
     probe_gateway(state, gateway, ProbeSlot::Heartbeat);
     state.last_heartbeat = None;
-    state.heartbeat_unanswered = 1;
-    state.heartbeat_reply_rx = None;
+    state.heartbeat_reply_rx = Some(SmolInstant::now());
 }
 
 /// Local port for the probe socket; bind(0) is rejected by smoltcp, and any
@@ -328,6 +322,38 @@ fn warn_once(state: &mut NetState, now: SmolInstant, msg: String) {
 }
 
 pub const WATCHDOG_LOG_INTERVAL: SmolDuration = SmolDuration::from_secs(30);
+
+/// Accrue heartbeat debt from gateway ARP questions that actually hit the
+/// wire this pass, and keep a silent gateway visible. Called by the
+/// netloop's counters block with the device's TX delta.
+///
+/// Debt counts questions, not fires: a fire whose neighbor entry is still
+/// valid sends a blind UDP:9 the gateway discards, asks nothing, and accrues
+/// nothing (the 0.2.9 zero-WARN puzzle: live debt never exceeded 1 because
+/// blind fires, the majority, accrued nothing). A question that goes
+/// unanswered makes smoltcp re-ask after its 1s rate limit, so a second
+/// outstanding question means a full second of gateway silence. WARN from
+/// there, rate-limited; a reply landing in the same pass pays the debt in
+/// heartbeat() right after, so a reply seen here mutes the alarm.
+pub fn note_arp_questions(state: &mut NetState, asked: u64, now: SmolInstant) {
+    if asked == 0 {
+        return;
+    }
+    let total = state.heartbeat_unanswered as u64 + asked;
+    state.heartbeat_unanswered = total.min(u32::MAX as u64) as u32;
+    if state.heartbeat_unanswered > 1 && !state.arp_reply_seen {
+        if let Some(gateway) = state.gateway {
+            warn_once(
+                state,
+                now,
+                format!(
+                    "gateway {gateway} silent: {} ARP requests unanswered",
+                    state.heartbeat_unanswered
+                ),
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -557,13 +583,19 @@ mod tests {
         state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
         state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(30);
         heartbeat(&mut state);
+        // The fire's question hits the wire in this pass's poll: the
+        // netloop's counters block accrues it before heartbeat() runs
+        // again.
+        note_arp_questions(&mut state, 1, SmolInstant::now());
         assert_eq!(state.heartbeat_unanswered, 1);
         let first = state.last_heartbeat.expect("heartbeat armed");
 
         // Probe's own ARP reply arrives: unicast fresh again, but for less
-        // than a heartbeat interval. A probe is outstanding, so the refresh
-        // pays the debt and KEEPS the 60s clock; firing again at the 20s
-        // arm threshold is exactly the 0.2.7 live regression.
+        // than a heartbeat interval. The refresh pays the debt, the reply
+        // is classified and snapshotted, and the clock KEEPS its cadence;
+        // firing again at the 20s arm threshold is exactly the 0.2.7 live
+        // regression.
+        state.arp_reply_seen = true;
         state.last_unicast_rx = SmolInstant::now();
         heartbeat(&mut state);
         assert_eq!(state.heartbeat_unanswered, 0, "probe reply pays the debt");
@@ -572,6 +604,7 @@ mod tests {
             Some(first),
             "probe reply must not reset the 60s clock"
         );
+        state.arp_reply_seen = false; // next pass delivered no new frames
 
         // The live trap: heartbeat() runs every pass, but last_unicast_rx
         // only changes when a NEW frame arrives. The same refresh is
@@ -596,7 +629,8 @@ mod tests {
         // Silence recrosses the threshold before the 60s interval elapsed
         // (e.g. 25s after the first heartbeat): the clock survived, so no
         // heartbeat fires. That is the fix: the phase only restarts on
-        // genuine client traffic, a refresh NEWER than the classified one.
+        // genuine client traffic, data unicast NEWER than the classified
+        // reply.
         state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(30);
         heartbeat(&mut state);
         assert_eq!(
@@ -606,40 +640,78 @@ mod tests {
         );
         assert_eq!(state.heartbeat_unanswered, 0, "nothing outstanding again");
 
-        // Genuine client traffic: a NEW refresh while no probe is
-        // outstanding. Only this ends the phase. (+1ms: Instant has
+        // Genuine client traffic: a data frame strictly newer than the
+        // classified reply. Only this ends the phase. (+1ms: Instant has
         // microsecond resolution and consecutive now() calls can tie.)
-        state.last_unicast_rx = SmolInstant::now() + SmolDuration::from_millis(1);
+        state.last_unicast_rx = SmolInstant::now();
+        state.last_data_rx = SmolInstant::now() + SmolDuration::from_millis(1);
         heartbeat(&mut state);
         assert_eq!(state.last_heartbeat, None, "genuine traffic ends phase");
         assert!(state.heartbeat_socket.is_none(), "socket reclaimed");
 
         // Now the wedge case: silence sustained, gateway never answers.
-        // Clock advanced past the interval: next heartbeat fires. Debt was
-        // paid, so the counter restarts from zero and climbs toward the
-        // visibility WARN on the probe after this one.
+        // Clock advanced past the interval: next heartbeat fires, and its
+        // question accrues debt on the wire.
         state.last_heartbeat = Some(SmolInstant::now() - SmolDuration::from_secs(61));
         state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(90);
         heartbeat(&mut state);
+        note_arp_questions(&mut state, 1, SmolInstant::now());
         assert_eq!(state.heartbeat_unanswered, 1);
         assert!(state.last_heartbeat.unwrap() > first);
     }
 
     #[test]
-    fn heartbeat_warns_only_when_gateway_stays_silent_across_probes() {
-        // First heartbeat of a phase is silent (the reply may still land);
-        // a second consecutive unanswered heartbeat means the ARP is not
-        // coming back and the half wedge must be visible.
+    fn unanswered_arp_reask_warns_and_first_question_stays_silent() {
+        // Debt counts questions on the wire, not fires. The first
+        // unanswered question stays quiet (the reply may still land);
+        // smoltcp re-asks after its 1s rate limit, so a second outstanding
+        // question means a full second of gateway silence: WARN there,
+        // rate-limited, never once per re-ask.
+        let mut state = test_state(true);
+        state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
+        note_arp_questions(&mut state, 1, SmolInstant::now());
+        assert_eq!(state.heartbeat_unanswered, 1); // silent: reply may land
+        assert!(
+            state.last_watchdog_log.is_none(),
+            "first question never WARNs"
+        );
+
+        note_arp_questions(&mut state, 1, SmolInstant::now());
+        assert_eq!(state.heartbeat_unanswered, 2); // WARN fired here
+        assert!(state.last_watchdog_log.is_some());
+    }
+
+    #[test]
+    fn arp_reply_same_pass_mutes_the_debt_warn() {
+        // A reply landing in the same pass pays the debt in heartbeat()
+        // right after the counters block; the WARN must not fire first on
+        // a gateway that is answering.
+        let mut state = test_state(true);
+        state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
+        state.arp_reply_seen = true;
+        note_arp_questions(&mut state, 2, SmolInstant::now());
+        assert_eq!(state.heartbeat_unanswered, 2);
+        assert!(
+            state.last_watchdog_log.is_none(),
+            "reply in the same pass mutes the WARN"
+        );
+    }
+
+    #[test]
+    fn blind_fire_accrues_no_debt() {
+        // The 0.2.9 zero-WARN puzzle, pinned from the other side: a fire
+        // whose neighbor entry is still valid sends a blind UDP:9 the
+        // gateway discards, asks nothing, accrues nothing. On a healthy
+        // idle LAN with the neighbor TTL matching the knob, every other
+        // fire is blind and the debt ledger stays at zero: no false WARN.
         let mut state = test_state(true);
         state.ever_unicast_rx = true;
         state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
-        state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(90);
+        state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(30);
         heartbeat(&mut state);
-        assert_eq!(state.heartbeat_unanswered, 1); // silent: reply may land
-
-        state.last_heartbeat = Some(SmolInstant::now() - SmolDuration::from_secs(61));
-        heartbeat(&mut state);
-        assert_eq!(state.heartbeat_unanswered, 2); // WARN fired here
+        note_arp_questions(&mut state, 0, SmolInstant::now()); // blind: no TX delta
+        assert_eq!(state.heartbeat_unanswered, 0);
+        assert!(state.heartbeat_socket.is_some(), "phase armed");
     }
 
     #[test]
@@ -653,6 +725,7 @@ mod tests {
         state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
         state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(30);
         heartbeat(&mut state);
+        note_arp_questions(&mut state, 1, SmolInstant::now()); // question on the wire
         assert!(state.heartbeat_socket.is_some());
         assert!(state.probe_started.is_none());
 
@@ -667,10 +740,14 @@ mod tests {
         assert!(state.last_heartbeat.is_some());
 
         // Probe reply landed in between (debt paid), then genuine client
-        // traffic breaks the silence: no probe outstanding, so heartbeat
-        // ends its own phase and reclaims the socket.
-        state.heartbeat_unanswered = 0;
+        // traffic breaks the silence: a data frame strictly newer than the
+        // classified reply ends the phase and reclaims the socket.
+        state.arp_reply_seen = true;
         state.last_unicast_rx = SmolInstant::now();
+        heartbeat(&mut state);
+        assert_eq!(state.heartbeat_unanswered, 0);
+        state.arp_reply_seen = false;
+        state.last_data_rx = SmolInstant::now() + SmolDuration::from_millis(1);
         heartbeat(&mut state);
         assert!(state.heartbeat_socket.is_none());
         assert_eq!(state.heartbeat_unanswered, 0);
@@ -689,24 +766,31 @@ mod tests {
         state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
         state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(30);
         heartbeat(&mut state);
+        note_arp_questions(&mut state, 1, SmolInstant::now()); // question TX'd
         assert_eq!(state.heartbeat_unanswered, 1);
 
-        // Probe reply lands: debt paid, clock kept.
+        // Probe reply lands: debt paid, clock kept, reply snapshotted.
+        state.arp_reply_seen = true;
         state.last_unicast_rx = SmolInstant::now();
         heartbeat(&mut state);
         assert_eq!(state.heartbeat_unanswered, 0);
         assert!(state.last_heartbeat.is_some());
+        state.arp_reply_seen = false;
 
-        // Sustained genuine traffic: a NEW unicast frame next pass
-        // (fresh timestamp), silence still broken. Only a refresh newer
-        // than the classified reply ends the phase; re-presenting the
-        // classified refresh must not.
+        // Sustained genuine traffic: the same data frame the snapshot
+        // classified is re-presented pass after pass (last_data_rx is a
+        // timestamp; it only moves when a NEW frame lands). Equality with
+        // the snapshot must not end the phase; only data strictly newer
+        // than the classified reply does. Using the snapshot itself keeps
+        // the tie deterministic: consecutive now() calls sometimes tie at
+        // microsecond resolution and sometimes do not.
+        state.last_data_rx = state.heartbeat_reply_rx.expect("snapshot taken");
         heartbeat(&mut state);
         assert!(
             state.last_heartbeat.is_some(),
             "re-presented refresh must not end the phase"
         );
-        state.last_unicast_rx = SmolInstant::now() + SmolDuration::from_millis(1);
+        state.last_data_rx = SmolInstant::now() + SmolDuration::from_millis(1);
         heartbeat(&mut state);
         assert_eq!(state.last_heartbeat, None, "genuine traffic ends phase");
         assert!(state.heartbeat_socket.is_none());
@@ -727,16 +811,30 @@ mod tests {
         state.last_unicast_rx = SmolInstant::now(); // lease exchange just landed
         refresh_gateway(&mut state, Ipv4Address::new(192, 168, 1, 1));
         assert!(state.heartbeat_socket.is_some(), "lease probe queued");
-        assert_eq!(state.heartbeat_unanswered, 1, "probe counts as outstanding");
+        assert_eq!(
+            state.heartbeat_unanswered, 0,
+            "debt accrues when the question hits the wire"
+        );
 
-        // Same-pass heartbeat with silence broken: debt paid, socket and
-        // packet survive to the next poll.
+        // The probe's question transmits on the next poll; the counters
+        // block accrues the debt, then the same-pass heartbeat with
+        // silence broken must not reclaim the socket: the debt snapshot
+        // taken at refresh time keeps the phase alive (the 0.2.6
+        // storm-class kill reached through the lease path).
+        note_arp_questions(&mut state, 1, SmolInstant::now());
         heartbeat(&mut state);
         assert!(
             state.heartbeat_socket.is_some(),
             "queued lease probe must survive the same-pass heartbeat"
         );
-        assert_eq!(state.heartbeat_unanswered, 0, "debt paid by the refresh");
+        assert_eq!(state.heartbeat_unanswered, 1);
+
+        // The gateway's reply pays the debt and the phase continues on the
+        // heartbeat clock.
+        state.arp_reply_seen = true;
+        heartbeat(&mut state);
+        assert_eq!(state.heartbeat_unanswered, 0, "lease reply pays the debt");
+        assert!(state.heartbeat_socket.is_some());
     }
 
     #[test]
@@ -752,6 +850,7 @@ mod tests {
         state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
         state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(30);
         heartbeat(&mut state);
+        note_arp_questions(&mut state, 1, SmolInstant::now()); // heartbeat question
         assert_eq!(state.heartbeat_unanswered, 1);
 
         // Demand wedge arms check()'s window and probes on the watchdog
@@ -759,35 +858,44 @@ mod tests {
         state.demand_pending = true;
         assert!(!check(&mut state));
         assert!(state.probe_socket.is_some());
+        state.arp_reply_seen = true;
         state.last_unicast_rx = SmolInstant::now();
 
-        // Heartbeat sees the refresh with a probe outstanding: debt paid,
-        // phase kept, no double probing out of the heartbeat slot.
+        // Heartbeat sees the reply with the debt outstanding: paid,
+        // classified, phase kept, no double probing out of the heartbeat
+        // slot.
         heartbeat(&mut state);
         assert_eq!(state.heartbeat_unanswered, 0, "check's reply pays the debt");
         assert!(state.last_heartbeat.is_some(), "clock kept");
     }
 
     #[test]
-    fn heartbeat_delayed_second_reply_ends_phase_as_genuine() {
-        // Accepted cost pinned: with two probes outstanding (reply latency
-        // >= heartbeat interval, a pathologically slow gateway), the first
-        // reply pays the debt and snapshots, the second reply is strictly
-        // newer and ends the phase. One off-cadence probe, self-limiting.
+    fn second_reply_keeps_phase_only_data_ends_it() {
+        // With two probes outstanding (reply latency >= heartbeat
+        // interval, a pathologically slow gateway), the first reply pays
+        // the whole debt and snapshots; the second reply is just another
+        // classified refresh, never genuine traffic, so under fix #3 it
+        // can no longer end the phase (the old cost: one off-cadence
+        // probe). The phase runs to its clock or to data unicast newer
+        // than the classified instant.
         let mut state = test_state(true);
         state.ever_unicast_rx = true;
         state.gateway = Some(Ipv4Address::new(192, 168, 1, 1));
         state.last_unicast_rx = SmolInstant::now() - SmolDuration::from_secs(90);
         heartbeat(&mut state);
+        note_arp_questions(&mut state, 1, SmolInstant::now()); // first question
         assert_eq!(state.heartbeat_unanswered, 1);
 
-        // Second heartbeat fires before any reply landed: two probes out.
+        // Second heartbeat fires before any reply landed: two questions
+        // out, both on the wire.
         state.last_heartbeat = Some(SmolInstant::now() - SmolDuration::from_secs(61));
         heartbeat(&mut state);
+        note_arp_questions(&mut state, 1, SmolInstant::now()); // second question
         assert_eq!(state.heartbeat_unanswered, 2);
         assert!(state.last_heartbeat.is_some());
 
-        // First reply lands: debt paid, snapshot taken, clock kept.
+        // First reply lands: debt paid in full, snapshot taken, clock kept.
+        state.arp_reply_seen = true;
         state.last_unicast_rx = SmolInstant::now();
         heartbeat(&mut state);
         assert_eq!(state.heartbeat_unanswered, 0);
@@ -795,19 +903,28 @@ mod tests {
             state.last_heartbeat.is_some(),
             "first reply keeps the phase"
         );
+        state.arp_reply_seen = false;
 
-        // The same refresh re-presented next pass: still no phase end.
-        heartbeat(&mut state);
-        assert!(state.last_heartbeat.is_some());
-
-        // Second reply lands (strictly newer): ends the phase on our own
-        // probe's reply. Accepted cost: one off-cadence probe, then the
-        // fresh phase is stable at heartbeat cadence.
+        // Second reply lands later (strictly newer refresh, still an ARP
+        // reply): classified again, phase survives. Data silence holds
+        // the phase to the clock.
+        state.arp_reply_seen = true;
         state.last_unicast_rx = SmolInstant::now() + SmolDuration::from_millis(1);
         heartbeat(&mut state);
-        assert_eq!(state.last_heartbeat, None, "second reply ends the phase");
-        assert_eq!(state.heartbeat_unanswered, 0);
+        assert!(
+            state.last_heartbeat.is_some(),
+            "a second reply must not end the phase"
+        );
+        assert!(state.heartbeat_socket.is_some());
+
+        // Only data unicast strictly newer than the classified instant
+        // ends the phase and reclaims the socket.
+        state.arp_reply_seen = false;
+        state.last_data_rx = SmolInstant::now() + SmolDuration::from_millis(2);
+        heartbeat(&mut state);
+        assert_eq!(state.last_heartbeat, None, "genuine data ends the phase");
         assert!(state.heartbeat_socket.is_none());
+        assert_eq!(state.heartbeat_unanswered, 0);
     }
 
     #[test]

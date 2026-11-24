@@ -334,6 +334,10 @@ fn run(mut dev: VmnetDevice, fds: LoopFds, cmd_rx: Receiver<NetCmd>, cfg: LoopCf
         last_heartbeat: None,
         heartbeat_unanswered: 0,
         heartbeat_reply_rx: None,
+        last_data_rx: SmolInstant::now(),
+        data_rx_last_seen: 0,
+        arp_reply_seen: false,
+        tx_arp_req_seen: 0,
         watchdog,
         tx_stall: SmolDuration::from_secs(30),
     };
@@ -452,6 +456,12 @@ fn run(mut dev: VmnetDevice, fds: LoopFds, cmd_rx: Receiver<NetCmd>, cfg: LoopCf
 
         let rx_before = state.dev.rx_taken();
         let uc_before = state.dev.rx_unicast();
+        let reply_before = state.dev.rx_arp_reply();
+        // Per-pass flag for the heartbeat: set when an ARP REPLY landed in
+        // this poll. Cleared before poll so a stale flag from a previous
+        // pass can never pay the debt twice or pay it with a data-only
+        // refresh.
+        state.arp_reply_seen = false;
         let _ = state
             .iface
             .poll(SmolInstant::now(), &mut state.dev, &mut state.sockets);
@@ -463,6 +473,22 @@ fn run(mut dev: VmnetDevice, fds: LoopFds, cmd_rx: Receiver<NetCmd>, cfg: LoopCf
             state.last_unicast_rx = SmolInstant::now();
             state.ever_unicast_rx = true;
         }
+        if state.dev.rx_arp_reply() > reply_before {
+            state.arp_reply_seen = true;
+        }
+        if state.dev.rx_unicast_data() > state.data_rx_last_seen {
+            state.last_data_rx = SmolInstant::now();
+            state.data_rx_last_seen = state.dev.rx_unicast_data();
+        }
+        // Gateway ARP questions that actually hit the wire this poll. A
+        // heartbeat fire whose neighbor entry is still valid sends a blind
+        // UDP:9 the gateway discards: no question, no debt. Only a gateway
+        // that stays silent past smoltcp's 1s re-ask accrues toward the
+        // visibility WARN (inside note_arp_questions).
+        let tx_arp_before = state.tx_arp_req_seen;
+        state.tx_arp_req_seen = state.dev.tx_arp_req();
+        let asked = state.tx_arp_req_seen.saturating_sub(tx_arp_before);
+        watchdog::note_arp_questions(&mut state, asked, SmolInstant::now());
 
         // Demand for the vmnet path: a DNS query in flight or a TCP connect
         // still establishing. Unicast silence matters when answers are due.
