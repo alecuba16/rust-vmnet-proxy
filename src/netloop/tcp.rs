@@ -12,6 +12,11 @@ pub const CONNECT_TIMEOUT: SmolDuration = SmolDuration::from_secs(10);
 const PUMP_CHUNK: usize = 16 * 1024;
 const SOCK_BUF: usize = 64 * 1024;
 
+/// Graceful close may strand the conn when the remote path is wedged: the
+/// FIN sits behind bytes that never drain, so the socket never reaches
+/// Closed. A deadline forces the abort path so the entry cannot leak.
+const CLOSE_TIMEOUT: SmolDuration = SmolDuration::from_secs(30);
+
 /// Only drain the socket while the rx pipe has this much headroom; beyond
 /// that leave bytes in the socket buffer so the TCP window closes.
 const RX_PIPE_HEADROOM: usize = 16 * 1024;
@@ -73,6 +78,7 @@ pub fn start_connect(
         tx_pipe: pipes.tx,
         tx_spill: Vec::new(),
         tx_stuck_since: None,
+        close_deadline: None,
         established: false,
         connect_deadline: Some(SmolInstant::now() + CONNECT_TIMEOUT),
         result_tx: Some(resp),
@@ -165,9 +171,15 @@ pub fn service(state: &mut NetState, id: u64) -> bool {
         let moved = conn.tx_pipe.try_push(&conn.tx_spill);
         if moved > 0 {
             conn.tx_spill.drain(..moved);
-            if conn.tx_spill.is_empty() {
-                conn.tx_stuck_since = None;
-            }
+            // Any progress proves the path is not wedged. A slowly draining
+            // remote keeps pushing the stall clock forward and must not be
+            // aborted while it is still moving bytes; a fully drained
+            // spill clears the timer.
+            conn.tx_stuck_since = if conn.tx_spill.is_empty() {
+                None
+            } else {
+                Some(SmolInstant::now())
+            };
         }
         let stuck_for = conn
             .tx_stuck_since
@@ -207,6 +219,21 @@ pub fn service(state: &mut NetState, id: u64) -> bool {
         let _ = state.sockets.remove(conn.handle);
         return true;
     }
+
+    // Graceful close that never completed: the FIN sits in a socket the
+    // wedged remote will not drain, so the entry would leak. Abort past
+    // the deadline; a healthy close reaches Closed and never gets here.
+    if conn.close_deadline.is_some_and(|d| SmolInstant::now() > d) {
+        log::warn!(
+            "conn {} close never drained: remote path wedged, aborting",
+            id
+        );
+        sock.abort();
+        conn.rx_pipe.close();
+        conn.tx_pipe.close();
+        let _ = state.sockets.remove(conn.handle);
+        return true;
+    }
     false
 }
 
@@ -222,11 +249,252 @@ pub fn handle_close(state: &mut NetState, id: u64) {
     let sock = state.sockets.get_mut::<tcp::Socket>(conn.handle);
     if conn.established && sock.state() == tcp::State::Established {
         sock.close();
+        // A wedged remote leaves the FIN stranded: the socket never drains
+        // to Closed and nothing else reaps the entry. Same deadline as the
+        // spill stall bounds this graceful phase.
+        conn.close_deadline = Some(SmolInstant::now() + CLOSE_TIMEOUT);
     } else {
         sock.abort();
         conn.rx_pipe.close();
         conn.tx_pipe.close();
         let _ = state.sockets.remove(conn.handle);
         state.tcp_conns.remove(&id);
+    }
+}
+
+/// Abort (RST) teardown used by every forced path: spill over cap, undrained
+/// stall, and a graceful close that never completes. Removes the socket and
+/// the map entry in one step (a dangling entry would service a stale handle
+/// next pass), closes both pipes so the splice threads unblock, and delivers
+/// Refused when the connect result is still owed. Returns true so callers
+/// can propagate the drop.
+pub fn abort_conn(state: &mut NetState, id: u64) -> bool {
+    let Some(mut conn) = state.tcp_conns.remove(&id) else {
+        return true;
+    };
+    conn.tx_spill.clear();
+    conn.tx_stuck_since = None;
+    let sock = state.sockets.get_mut::<tcp::Socket>(conn.handle);
+    sock.abort();
+    conn.rx_pipe.close();
+    conn.tx_pipe.close();
+    let _ = state.sockets.remove(conn.handle);
+    send_result(&mut conn, ConnectResult::Refused);
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::netloop::testsupport::test_state;
+    use crate::pipe::Pipe;
+    use smoltcp::wire::{IpAddress, Ipv4Address};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+
+    const REMOTE: SocketAddr =
+        SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 9)), 80);
+    const LOCAL_TEST_PORT: u16 = 41111;
+
+    /// A conn with the established flag set, but a socket the harness can
+    /// never drive through a real handshake: no vmnet frames arrive, so the
+    /// socket sits in SynSent while the conn logic treats it as pumping.
+    /// Exactly the wedged-remote shape the stall and deadline paths guard.
+    fn wedged_conn(state: &mut NetState, spill: usize) -> (u64, mpsc::Receiver<ConnectResult>) {
+        let (resp_tx, resp_rx) = mpsc::channel();
+        let id = state.tcp_conns.keys().copied().max().unwrap_or(0) + 1;
+        let handle = {
+            let rx = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
+            let tx = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
+            let mut sock = tcp::Socket::new(rx, tx);
+            sock.connect(
+                state.iface.context(),
+                IpEndpoint::new(
+                    IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 9)),
+                    REMOTE.port(),
+                ),
+                IpListenEndpoint::from(LOCAL_TEST_PORT),
+            )
+            .unwrap();
+            state.sockets.add(sock)
+        };
+        let conn = TcpConn {
+            handle,
+            remote: REMOTE,
+            rx_pipe: Arc::new(Pipe::new()),
+            tx_pipe: Arc::new(Pipe::new()),
+            tx_spill: Vec::new(),
+            tx_stuck_since: None,
+            close_deadline: None,
+            established: true,
+            connect_deadline: None,
+            result_tx: Some(resp_tx),
+            result_sent: false,
+        };
+        state.tcp_conns.insert(id, conn);
+        if spill > 0 {
+            state
+                .tcp_conns
+                .get_mut(&id)
+                .unwrap()
+                .spill_write(&vec![0u8; spill], SmolInstant::now());
+        }
+        (id, resp_rx)
+    }
+
+    #[test]
+    fn abort_conn_tears_down_socket_pipes_and_entry() {
+        let mut state = test_state(true);
+        let (id, resp_rx) = wedged_conn(&mut state, 16 * 1024);
+        let (handle, rx_pipe, tx_pipe) = {
+            let conn = state.tcp_conns.get(&id).unwrap();
+            (
+                conn.handle,
+                Arc::clone(&conn.rx_pipe),
+                Arc::clone(&conn.tx_pipe),
+            )
+        };
+
+        assert!(abort_conn(&mut state, id));
+
+        // abort_conn removes the entry itself; only a stale handle would be
+        // left otherwise, and SocketSet::get panics on those.
+        assert!(!state.tcp_conns.contains_key(&id), "entry must be gone");
+        let socket_gone = state.sockets.iter().all(|(h, _)| h != handle);
+        assert!(socket_gone, "socket must be removed");
+        assert!(rx_pipe.is_closed());
+        assert!(tx_pipe.is_closed());
+        let refused = resp_rx.recv_timeout(std::time::Duration::from_secs(1)).ok();
+        assert!(
+            matches!(refused, Some(ConnectResult::Refused)),
+            "abort must deliver the owed result"
+        );
+    }
+
+    #[test]
+    fn spill_progress_pushes_stall_clock_forward() {
+        let mut state = test_state(true);
+        let (id, _resp_rx) = wedged_conn(&mut state, 64 * 1024);
+
+        // tx_pipe full: the first pass cannot move spill, the timer starts.
+        assert_eq!(
+            state
+                .tcp_conns
+                .get_mut(&id)
+                .unwrap()
+                .tx_pipe
+                .try_push(&vec![1u8; 256 * 1024]),
+            256 * 1024
+        );
+        assert!(!service(&mut state, id));
+        assert!(
+            state.tcp_conns.get(&id).unwrap().tx_stuck_since.is_some(),
+            "stall timer must start on first pass"
+        );
+
+        // Free room: the pass moves spill into tx_pipe, and the timer must
+        // survive partial progress (spill still nonempty, so not cleared).
+        let _ = state
+            .tcp_conns
+            .get_mut(&id)
+            .unwrap()
+            .tx_pipe
+            .take(16 * 1024);
+        assert!(!service(&mut state, id));
+        assert!(
+            state.tcp_conns.get(&id).unwrap().tx_stuck_since.is_some(),
+            "timer must survive partial progress"
+        );
+
+        // The discriminator: a stall clock already past tx_stall must be
+        // forgiven by fresh progress. The old code (timer cleared only on a
+        // fully drained spill) kept the backdated clock and aborted here.
+        {
+            let conn = state.tcp_conns.get_mut(&id).unwrap();
+            conn.tx_stuck_since =
+                Some(SmolInstant::now() - state.tx_stall - SmolDuration::from_secs(1));
+        }
+        let _ = state
+            .tcp_conns
+            .get_mut(&id)
+            .unwrap()
+            .tx_pipe
+            .take(16 * 1024);
+        assert!(!service(&mut state, id));
+        assert!(
+            state.tcp_conns.contains_key(&id),
+            "conn must survive while spill still makes progress"
+        );
+    }
+
+    #[test]
+    fn spill_zero_progress_hits_stall_and_aborts() {
+        let mut state = test_state(true);
+        let (id, resp_rx) = wedged_conn(&mut state, 64 * 1024);
+
+        // tx_pipe full and sock tx full: zero bytes can move, the stall
+        // must abort. Backdate the timer past tx_stall.
+        assert_eq!(
+            state
+                .tcp_conns
+                .get_mut(&id)
+                .unwrap()
+                .tx_pipe
+                .try_push(&vec![1u8; 256 * 1024]),
+            256 * 1024
+        );
+        {
+            let conn = state.tcp_conns.get_mut(&id).unwrap();
+            conn.tx_stuck_since =
+                Some(SmolInstant::now() - state.tx_stall - SmolDuration::from_secs(1));
+        }
+
+        assert!(service(&mut state, id), "wedged spill must abort");
+        // service() signals the drop; the caller (netloop) removes the entry
+        state.tcp_conns.remove(&id);
+        assert!(
+            !state.tcp_conns.contains_key(&id),
+            "caller removes the entry"
+        );
+        // The stall path aborts an established conn: no result is owed (Ok
+        // was already delivered on the real handshake), the channel sees EOF.
+        assert!(resp_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_err());
+        // servicing a removed id is a clean no-op
+        assert!(service(&mut state, id));
+    }
+
+    #[test]
+    fn close_deadline_enforced_for_stranded_fin() {
+        let mut state = test_state(true);
+        let (id, _resp_rx) = wedged_conn(&mut state, 0);
+        {
+            let conn = state.tcp_conns.get_mut(&id).unwrap();
+            conn.close_deadline = Some(SmolInstant::now() - SmolDuration::from_secs(1));
+        }
+
+        assert!(
+            service(&mut state, id),
+            "stranded FIN must abort past deadline"
+        );
+        state.tcp_conns.remove(&id);
+        assert!(
+            !state.tcp_conns.contains_key(&id),
+            "caller removes the entry"
+        );
+    }
+
+    #[test]
+    fn healthy_close_clears_no_deadline_stray() {
+        let mut state = test_state(true);
+        let (id, resp_rx) = wedged_conn(&mut state, 0);
+
+        // Close command: established + SynSent sock takes the abort branch
+        // and removes the entry; no deadline can stray on a healthy close.
+        handle_close(&mut state, id);
+        assert!(!state.tcp_conns.contains_key(&id));
+        // The close path owed no result: nothing to deliver either way.
+        assert!(resp_rx.try_recv().is_err());
     }
 }

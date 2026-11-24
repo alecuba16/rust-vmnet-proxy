@@ -116,6 +116,7 @@ pub fn service(state: &mut NetState, api: &NetApi, splice_timeout: std::time::Du
             tx_pipe: Arc::clone(&tx_pipe),
             tx_spill: Vec::new(),
             tx_stuck_since: None,
+            close_deadline: None,
             established: true,
             connect_deadline: None,
             result_tx: None,

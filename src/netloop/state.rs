@@ -32,6 +32,10 @@ pub struct TcpConn {
     /// When tx_spill first went nonempty. A spill that cannot drain for
     /// this long means the remote path is wedged: tear the conn down.
     pub tx_stuck_since: Option<SmolInstant>,
+    /// Deadline for a graceful close (FIN) to reach Closed. A wedged remote
+    /// strands the FIN; past the deadline service() aborts the conn so the
+    /// map entry cannot leak. None while no graceful close is in flight.
+    pub close_deadline: Option<SmolInstant>,
     pub established: bool,
     pub connect_deadline: Option<smoltcp::time::Instant>,
     pub result_tx: Option<Sender<ConnectResult>>,
@@ -140,6 +144,10 @@ pub struct NetState<'a> {
     /// flows so the first heartbeat of an idle gap fires at the arm
     /// threshold, not a full interval later.
     pub last_heartbeat: Option<SmolInstant>,
+    /// Heartbeats sent since the last one got an answer (ARP reply seen).
+    /// Above 1 the gateway is not answering our idle probes: keep probing
+    /// but make the half wedge visible in the log.
+    pub heartbeat_unanswered: u32,
     /// Timing knobs for the rx watchdog.
     pub watchdog: WatchdogThresholds,
     /// How long a full tx path may hold undrained spill before the conn is
