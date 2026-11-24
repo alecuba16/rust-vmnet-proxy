@@ -16,7 +16,7 @@ use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
 use crate::cmds::{ConnHandle, ConnPipes, ConnectResult, NetCmd};
-use crate::netloop::state::NetState;
+use crate::netloop::state::{NetState, WatchdogThresholds};
 use crate::pipe::Pipe;
 use crate::vmnet_dev::VmnetDevice;
 
@@ -117,13 +117,55 @@ pub fn spawn(
     tuning: crate::config::Tuning,
     relays: Vec<crate::config::Relay>,
 ) -> Result<NetLoop, String> {
+    spawn_inner(
+        socket_path,
+        mac,
+        tuning,
+        relays,
+        WatchdogThresholds::default(),
+        std::time::Duration::from_secs(2),
+        30,
+    )
+}
+
+/// Test-only entry: same loop as spawn but with watchdog thresholds and a
+/// bounded connect retry (the fake daemon is up before the call, so one
+/// attempt suffices).
+#[doc(hidden)]
+pub fn spawn_for_test(
+    socket_path: &str,
+    mac: [u8; 6],
+    tuning: crate::config::Tuning,
+    relays: Vec<crate::config::Relay>,
+    watchdog: WatchdogThresholds,
+) -> Result<NetLoop, String> {
+    spawn_inner(
+        socket_path,
+        mac,
+        tuning,
+        relays,
+        watchdog,
+        std::time::Duration::from_millis(50),
+        1,
+    )
+}
+
+fn spawn_inner(
+    socket_path: &str,
+    mac: [u8; 6],
+    tuning: crate::config::Tuning,
+    relays: Vec<crate::config::Relay>,
+    watchdog: WatchdogThresholds,
+    retry_sleep: std::time::Duration,
+    attempts: u32,
+) -> Result<NetLoop, String> {
     // Boot race: the socket_vmnet daemon may still be starting when the
     // proxy launches (launchd starts both near-simultaneously). Bounded
     // retry; on final failure the caller exits nonzero and the service
     // supervisor (KeepAlive) respawns.
     let mut dev = None;
     let mut last_err = String::new();
-    for attempt in 1..=30 {
+    for attempt in 1..=attempts {
         match VmnetDevice::connect(socket_path, mac) {
             Ok(d) => {
                 dev = Some(d);
@@ -134,7 +176,7 @@ pub fn spawn(
                     log::warn!("vmnet socket not ready ({e}), retrying");
                 }
                 last_err = e.to_string();
-                std::thread::sleep(std::time::Duration::from_secs(2));
+                std::thread::sleep(retry_sleep);
             }
         }
     }
@@ -148,20 +190,36 @@ pub fn spawn(
 
     let join = std::thread::Builder::new()
         .name("netloop".into())
-        .spawn(move || run(dev, vmnet_fd, wake_r, cmd_rx, tuning, relays, loop_api))
+        .spawn(move || {
+            run(
+                dev,
+                LoopFds { vmnet_fd, wake_r },
+                cmd_rx,
+                tuning,
+                relays,
+                loop_api,
+                watchdog,
+            )
+        })
         .map_err(|e| format!("spawn netloop: {e}"))?;
 
     Ok(NetLoop { api, join })
 }
 
-fn run(
-    mut dev: VmnetDevice,
+/// File descriptors the loop's poll() watches, moved into the loop thread.
+struct LoopFds {
     vmnet_fd: i32,
     wake_r: i32,
+}
+
+fn run(
+    mut dev: VmnetDevice,
+    fds: LoopFds,
     cmd_rx: Receiver<NetCmd>,
     tuning: crate::config::Tuning,
     relays: Vec<crate::config::Relay>,
     api: NetApi,
+    watchdog: WatchdogThresholds,
 ) {
     let mac = dev.mac();
     let if_cfg = IfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
@@ -195,6 +253,7 @@ fn run(
         probe_started: None,
         last_watchdog_log: None,
         probe_socket: None,
+        watchdog,
     };
 
     if let Err(e) = relay::init(&mut state, &relays) {
@@ -218,20 +277,20 @@ fn run(
             None => delay,
         }
         .max(SmolDuration::from_millis(1));
-        let mut fds = [
+        let mut pollfds = [
             libc::pollfd {
-                fd: vmnet_fd,
+                fd: fds.vmnet_fd,
                 events: libc::POLLIN,
                 revents: 0,
             },
             libc::pollfd {
-                fd: wake_r,
+                fd: fds.wake_r,
                 events: libc::POLLIN,
                 revents: 0,
             },
         ];
         let timeout_ms = delay.total_millis() as i32;
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
+        let n = unsafe { libc::poll(pollfds.as_mut_ptr(), 2, timeout_ms) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
@@ -241,11 +300,12 @@ fn run(
             return;
         }
 
-        if fds[1].revents & libc::POLLIN != 0 {
+        if pollfds[1].revents & libc::POLLIN != 0 {
             let mut buf = [0u8; 8192];
             loop {
-                let n =
-                    unsafe { libc::read(wake_r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                let n = unsafe {
+                    libc::read(fds.wake_r, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                };
                 if n <= 0 {
                     break;
                 }

@@ -34,6 +34,28 @@ pub struct DnsPending {
     pub deadline: smoltcp::time::Instant,
 }
 
+/// Watchdog timing knobs. Production defaults live in Default; the e2e test
+/// shortens them so a wedge plays out in seconds.
+#[derive(Debug, Clone, Copy)]
+pub struct WatchdogThresholds {
+    /// Total rx silence while online before the watchdog arms.
+    pub silence: SmolDuration,
+    /// Unicast rx silence while online before the unicast arm arms.
+    pub unicast_silence: SmolDuration,
+    /// How long the gateway probe must stay unanswered before exit.
+    pub probe_window: SmolDuration,
+}
+
+impl Default for WatchdogThresholds {
+    fn default() -> Self {
+        WatchdogThresholds {
+            silence: SmolDuration::from_secs(45),
+            unicast_silence: SmolDuration::from_secs(20),
+            probe_window: SmolDuration::from_secs(15),
+        }
+    }
+}
+
 /// Complete netloop state. Owned by the netloop thread only.
 pub struct NetState<'a> {
     pub dev: VmnetDevice,
@@ -82,4 +104,6 @@ pub struct NetState<'a> {
     /// UDP socket used to force ARP for the gateway while the probe window
     /// runs; removed on disarm.
     pub probe_socket: Option<SocketHandle>,
+    /// Timing knobs for the rx watchdog.
+    pub watchdog: WatchdogThresholds,
 }

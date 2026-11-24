@@ -1,35 +1,9 @@
-mod cmds;
-mod config;
-mod legchain;
-mod logging;
-mod netloop;
-mod pipe;
-mod service;
-mod setup_vmnet;
-mod socks5;
-mod sshlegs;
-mod vmnet_dev;
-
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-pub static RUNNING: AtomicBool = AtomicBool::new(true);
-
-extern "C" fn on_signal(_sig: libc::c_int) {
-    RUNNING.store(false, Ordering::SeqCst);
-}
-
-fn install_signal_handlers() {
-    let handler = on_signal as *const ();
-    unsafe {
-        libc::signal(libc::SIGINT, handler as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
-        // splice take_blocking and netloop poll timeouts come from
-        // power_mode; battery floors shutdown notice at the main loop's
-        // 200ms sleep + splice timeout, performance is snappier.
-        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
-    }
-}
+use rust_vmnet_proxy::setup_vmnet;
+use rust_vmnet_proxy::{config, legchain, logging, netloop, service, socks5, sshlegs};
+use rust_vmnet_proxy::{install_signal_handlers, RUNNING};
 
 fn print_usage() {
     println!(

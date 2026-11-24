@@ -17,6 +17,12 @@ pub struct Pipe {
     cv: Condvar,
 }
 
+impl Default for Pipe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Pipe {
     pub fn new() -> Self {
         Pipe {
@@ -131,6 +137,10 @@ impl Pipe {
     pub fn len(&self) -> usize {
         self.state.lock().unwrap().buf.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[cfg(test)]
@@ -220,7 +230,7 @@ mod tests {
             assert!(p2.push(&big));
         });
         std::thread::sleep(Duration::from_millis(50));
-        while p.len() > 0 {
+        while !p.is_empty() {
             p.take(PIPE_CAP);
         }
         handle.join().unwrap();
@@ -246,7 +256,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(p.len(), PIPE_CAP, "pusher never filled the pipe");
-        while p.len() > 0 {
+        while !p.is_empty() {
             p.take(PIPE_CAP);
         }
         handle.join().unwrap();

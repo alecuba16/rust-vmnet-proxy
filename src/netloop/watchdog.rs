@@ -46,11 +46,16 @@ pub fn check(state: &mut NetState) -> bool {
     let now = SmolInstant::now();
     let silent_for = now - state.last_rx;
     let uc_silent_for = now - state.last_unicast_rx;
+    let th = state.watchdog;
 
-    let total_wedged = state.online && state.ever_rx && silent_for >= WATCHDOG_SILENCE;
+    let total_wedged = state.online
+        && state.ever_rx
+        && silent_for >= th.silence
+        && th.silence != SmolDuration::ZERO;
     let unicast_wedged = state.online
         && state.ever_unicast_rx
-        && uc_silent_for >= WATCHDOG_UNICAST_SILENCE
+        && uc_silent_for >= th.unicast_silence
+        && th.unicast_silence != SmolDuration::ZERO
         && state.demand_pending;
 
     if !total_wedged && !unicast_wedged {
@@ -99,7 +104,7 @@ pub fn check(state: &mut NetState) -> bool {
     probe_gateway(state, gateway);
 
     let probed_for = now - state.probe_started.expect("armed above");
-    if probed_for < WATCHDOG_PROBE_WINDOW {
+    if probed_for < th.probe_window {
         return false;
     }
 
@@ -112,7 +117,7 @@ pub fn check(state: &mut NetState) -> bool {
         "vmnet {kind} wedged: {}s silence while online, gateway {} never answered within {}s; exiting for supervisor restart",
         gap.secs(),
         gateway,
-        WATCHDOG_PROBE_WINDOW.secs(),
+        th.probe_window.secs(),
     );
     true
 }
@@ -176,10 +181,7 @@ fn warn_once(state: &mut NetState, now: SmolInstant, msg: String) {
     }
 }
 
-const WATCHDOG_SILENCE: SmolDuration = SmolDuration::from_secs(45);
-const WATCHDOG_UNICAST_SILENCE: SmolDuration = SmolDuration::from_secs(20);
-const WATCHDOG_PROBE_WINDOW: SmolDuration = SmolDuration::from_secs(15);
-const WATCHDOG_LOG_INTERVAL: SmolDuration = SmolDuration::from_secs(30);
+pub const WATCHDOG_LOG_INTERVAL: SmolDuration = SmolDuration::from_secs(30);
 
 #[cfg(test)]
 mod tests {
@@ -193,7 +195,7 @@ mod tests {
     use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
     use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
-    use crate::netloop::state::NetState;
+    use crate::netloop::state::{NetState, WatchdogThresholds};
     use crate::vmnet_dev::VmnetDevice;
 
     static TEST_N: AtomicU32 = AtomicU32::new(0);
@@ -245,6 +247,7 @@ mod tests {
             probe_started: None,
             last_watchdog_log: None,
             probe_socket: None,
+            watchdog: WatchdogThresholds::default(),
         }
     }
 
