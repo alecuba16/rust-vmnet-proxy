@@ -158,6 +158,18 @@ fn write_plist_as_root(plist: &str) -> Result<(), String> {
     if !mv_ok {
         return Err(format!("sudo mv {} {PLIST_PATH} failed", tmp.display()));
     }
+    // launchd rejects system LaunchDaemons not owned by root:wheel
+    // (bootstrap fails with I/O error 5). sudo mv preserves the user
+    // ownership of the temp file, so reset it explicitly.
+    eprintln!("sudo> /usr/sbin/chown root:wheel {PLIST_PATH}");
+    let chown_ok = Command::new("sudo")
+        .args(["/usr/sbin/chown", "root:wheel", PLIST_PATH])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !chown_ok {
+        return Err(format!("sudo chown root:wheel {PLIST_PATH} failed"));
+    }
     Ok(())
 }
 
