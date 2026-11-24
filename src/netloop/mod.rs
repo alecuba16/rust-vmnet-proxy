@@ -3,6 +3,8 @@ pub mod dns;
 pub mod relay;
 pub mod state;
 pub mod tcp;
+#[cfg(test)]
+pub mod testsupport;
 pub mod watchdog;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,11 +41,14 @@ pub struct Liveness {
     expected_ms: AtomicU64,
 }
 
-fn wall_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+/// Monotonic millis since process start. Liveness must not use the wall
+/// clock: an NTP step forward or a wake from sleep would look like a hung
+/// loop and false-restart the service.
+fn mono_ms() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 impl Liveness {
@@ -56,7 +61,7 @@ impl Liveness {
 
     pub fn publish(&self, expected_ms: u64) {
         self.expected_ms.store(expected_ms, Ordering::Relaxed);
-        self.last_ms.store(wall_ms(), Ordering::Release);
+        self.last_ms.store(mono_ms(), Ordering::Release);
     }
 
     /// True when the loop went silent for longer than its published
@@ -67,7 +72,7 @@ impl Liveness {
         if expected == u64::MAX {
             return false;
         }
-        wall_ms().saturating_sub(last) > expected.saturating_add(slack.as_millis() as u64)
+        mono_ms().saturating_sub(last) > expected.saturating_add(slack.as_millis() as u64)
     }
 }
 
@@ -326,6 +331,7 @@ fn run(mut dev: VmnetDevice, fds: LoopFds, cmd_rx: Receiver<NetCmd>, cfg: LoopCf
         last_watchdog_log: None,
         probe_socket: None,
         last_heartbeat: None,
+        heartbeat_unanswered: 0,
         watchdog,
         tx_stall: SmolDuration::from_secs(30),
     };
@@ -365,7 +371,10 @@ fn run(mut dev: VmnetDevice, fds: LoopFds, cmd_rx: Receiver<NetCmd>, cfg: LoopCf
         ];
         let timeout_ms = delay.total_millis() as i32;
         // publish the expected sleep so the liveness watchdog can tell a
-        // legal long poll from a park; poll is the only legal long wait
+        // legal long poll from a park; poll is the only legal long wait.
+        // The 10s slack in main covers pass work between publishes too
+        // (cmd drain, socket service, pipe locks); fine for the current
+        // conn scale, revisit if passes ever legitimately approach it.
         liveness.publish(timeout_ms.max(0) as u64);
         let n = unsafe { libc::poll(pollfds.as_mut_ptr(), 2, timeout_ms) };
         if n < 0 {
@@ -418,7 +427,9 @@ fn run(mut dev: VmnetDevice, fds: LoopFds, cmd_rx: Receiver<NetCmd>, cfg: LoopCf
                                 "conn {} tx spill over cap: remote path wedged, closing",
                                 id
                             );
-                            tcp::handle_close(&mut state, id);
+                            // abort, not graceful close: a wedged remote never
+                            // drains the FIN, and the entry would leak
+                            tcp::abort_conn(&mut state, id);
                         }
                     }
                     NetCmd::Close { id } => {
