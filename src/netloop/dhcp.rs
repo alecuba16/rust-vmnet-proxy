@@ -7,6 +7,9 @@ use crate::netloop::state::NetState;
 /// address, default route, DNS servers (creating the dns socket on first
 /// config), flips online, and logs. Deconfigured tears all of that down.
 pub fn service(state: &mut NetState) {
+    // Gateway to re-ARP after the match: cfg keeps the dhcp socket borrowed
+    // through the Configured arm, and the probe needs the whole state.
+    let mut refresh: Option<smoltcp::wire::Ipv4Address> = None;
     let event = state
         .sockets
         .get_mut::<dhcpv4::Socket>(state.dhcp_handle)
@@ -25,6 +28,11 @@ pub fn service(state: &mut NetState) {
             if let Some(router) = cfg.router {
                 state.gateway = Some(router);
                 let _ = state.iface.routes_mut().add_default_ipv4_route(router);
+                // Renewal cycles can leave the unicast path on a stale
+                // neighbor entry: blackouts have been observed starting
+                // seconds after Configured. Force ARP for the gateway while
+                // the lease is fresh.
+                refresh = Some(router);
             } else {
                 state.gateway = None;
                 state.iface.routes_mut().remove_default_ipv4_route();
@@ -67,5 +75,8 @@ pub fn service(state: &mut NetState) {
             }
         }
         None => {}
+    }
+    if let Some(router) = refresh {
+        crate::netloop::watchdog::refresh_gateway(state, router);
     }
 }

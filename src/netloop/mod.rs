@@ -325,6 +325,7 @@ fn run(mut dev: VmnetDevice, fds: LoopFds, cmd_rx: Receiver<NetCmd>, cfg: LoopCf
         probe_started: None,
         last_watchdog_log: None,
         probe_socket: None,
+        last_heartbeat: None,
         watchdog,
         tx_stall: SmolDuration::from_secs(30),
     };
@@ -459,6 +460,7 @@ fn run(mut dev: VmnetDevice, fds: LoopFds, cmd_rx: Receiver<NetCmd>, cfg: LoopCf
         dns::service(&mut state);
         relay::service(&mut state, &api, tuning.splice_timeout);
 
+        watchdog::heartbeat(&mut state);
         if watchdog::check(&mut state) {
             return;
         }
