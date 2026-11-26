@@ -15,7 +15,9 @@ use crate::vmnet_dev::VmnetDevice;
 
 /// Cap on the per-conn spill held when a Write command arrives while tx_pipe
 /// is full. Beyond it the conn is torn down: one wedged client must not hold
-/// unbounded netloop memory.
+/// unbounded netloop memory. Production splicers never send non-empty Write
+/// commands (data flows through pipe push), so this only bounds the test
+/// harness and any future direct-Write caller.
 const TX_SPILL_CAP: usize = 64 * 1024;
 
 /// Per-connection state held by the netloop.

@@ -23,7 +23,7 @@ smoltcp = { version = "0.14", default-features = false, features = [
     "fragmentation-buffer-size-65536",
     "assembler-max-segment-count-32",
     "auto-icmp-echo-reply",
-    "socket-tcp-reno",
+    "socket-tcp-cubic",
 ] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

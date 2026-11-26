@@ -9,7 +9,7 @@ use crate::netloop::NetApi;
 use crate::pipe::Deadline;
 
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
-const SPLICE_CHUNK: usize = 16 * 1024;
+const SPLICE_CHUNK: usize = 64 * 1024;
 
 /// Loop timing knobs for the listener and splice threads (from power_mode).
 #[derive(Debug, Clone)]
