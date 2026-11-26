@@ -15,8 +15,11 @@ use crate::pipe::{Deadline, Pipe};
 /// fresh listener for the same port in the same pass. Extra slots absorb
 /// simultaneous SYNs while the promoted one is being replaced.
 const LISTENER_BACKLOG: usize = 4;
-const SOCK_BUF: usize = 64 * 1024;
-const SPLICE_CHUNK: usize = 16 * 1024;
+/// Match tcp.rs SOCK_RX_BUF/SOCK_TX_BUF so relay conns get the same scaled
+/// TCP window as direct SOCKS conns.
+const SOCK_RX_BUF: usize = 2 * 1024 * 1024;
+const SOCK_TX_BUF: usize = 512 * 1024;
+const SPLICE_CHUNK: usize = 64 * 1024;
 
 /// Per-relay runtime state owned by the netloop.
 pub struct RelayState {
@@ -28,8 +31,8 @@ pub struct RelayState {
 /// Arm one listening socket on the relay port. Binding the unspecified
 /// endpoint covers the stack's single DHCP address.
 fn arm_listener(state: &mut NetState, port: u16) -> Result<smoltcp::iface::SocketHandle, String> {
-    let rx = tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]);
-    let tx = tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]);
+    let rx = tcp::SocketBuffer::new(vec![0u8; SOCK_RX_BUF]);
+    let tx = tcp::SocketBuffer::new(vec![0u8; SOCK_TX_BUF]);
     let mut sock = tcp::Socket::new(rx, tx);
     if sock.listen(IpListenEndpoint::from(port)).is_err() {
         return Err(format!("relay :{port}: listen failed"));

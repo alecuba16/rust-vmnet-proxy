@@ -1,6 +1,6 @@
 [package]
 name = "rust-vmnet-proxy"
-version = "0.2.11"
+version = "0.2.12"
 edition = "2021"
 description = "Rootless macOS proxy: direct SOCKS5 via bridged socket_vmnet plus supervised SSH tunnels"
 license = "MIT"
@@ -8,7 +8,6 @@ license = "MIT"
 [dependencies]
 smoltcp = { version = "0.14", default-features = false, features = [
     "std",
-    "log",
     "medium-ethernet",
     "proto-ipv4",
     "proto-dhcpv4",
@@ -23,12 +22,19 @@ smoltcp = { version = "0.14", default-features = false, features = [
     "fragmentation-buffer-size-65536",
     "assembler-max-segment-count-32",
     "auto-icmp-echo-reply",
-    "socket-tcp-reno",
+    "socket-tcp-cubic",
 ] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 log = { version = "0.4", features = ["std"] }
+
+[features]
+# smoltcp's "log" feature maps every per-packet tcp_trace! to log::trace!;
+# production keeps it off (Mullvad ships smoltcp the same way). Diagnosing
+# the stack needs `cargo run --features smoltcp-trace` with level=trace.
+default = []
+smoltcp-trace = ["smoltcp/log"]
 
 [dev-dependencies]
 smoltcp = { version = "0.14", default-features = false, features = [

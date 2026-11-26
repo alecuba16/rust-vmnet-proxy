@@ -255,7 +255,7 @@ fn handle_chain_client(
     let mut up = match upstream_connect(upstream_port, ip, &name, port) {
         Ok(u) => u,
         Err(e) => {
-            log::info!("leg {listen} upstream connect {target} failed: {e}");
+            log::debug!("leg {listen} upstream connect {target} failed: {e}");
             send_reply(&mut client, 0x01);
             return;
         }
@@ -270,7 +270,7 @@ fn handle_chain_client(
     if !send_reply(&mut client, 0x00) {
         return;
     }
-    log::info!(
+    log::debug!(
         "CONNECT {} -> {target} [leg {listen} identify]",
         peer.map(|p| p.to_string())
             .unwrap_or_else(|| "unknown".into())

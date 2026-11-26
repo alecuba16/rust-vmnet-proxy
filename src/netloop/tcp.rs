@@ -9,8 +9,15 @@ use crate::cmds::{ConnPipes, ConnectResult};
 use crate::netloop::state::{NetState, TcpConn};
 
 pub const CONNECT_TIMEOUT: SmolDuration = SmolDuration::from_secs(10);
-const PUMP_CHUNK: usize = 16 * 1024;
-const SOCK_BUF: usize = 64 * 1024;
+/// Socket buffer sizes. smoltcp derives the advertised window-scale shift
+/// from log2(rx buffer): 64 KiB advertises shift 0, so the receive window
+/// never exceeds 64 KiB and throughput caps at window/RTT (~10-20 Mbps on a
+/// ~30 ms path). 2 MiB negotiates shift 5, a 2 MiB effective window, which
+/// covers ~600 Mbps up to ~27 ms RTT (BDP) before the netloop thread
+/// itself becomes the limit.
+const SOCK_RX_BUF: usize = 2 * 1024 * 1024;
+const SOCK_TX_BUF: usize = 512 * 1024;
+const PUMP_CHUNK: usize = 64 * 1024;
 
 /// Graceful close may strand the conn when the remote path is wedged: the
 /// FIN sits behind bytes that never drain, so the socket never reaches
@@ -18,8 +25,10 @@ const SOCK_BUF: usize = 64 * 1024;
 const CLOSE_TIMEOUT: SmolDuration = SmolDuration::from_secs(30);
 
 /// Only drain the socket while the rx pipe has this much headroom; beyond
-/// that leave bytes in the socket buffer so the TCP window closes.
-const RX_PIPE_HEADROOM: usize = 16 * 1024;
+/// that leave bytes in the socket buffer so the TCP window closes. Kept in
+/// step with PUMP_CHUNK: drain tops the pipe up to headroom + PUMP_CHUNK,
+/// which must stay under PIPE_CAP so the blocking push never parks.
+const RX_PIPE_HEADROOM: usize = 64 * 1024;
 
 /// Zero local port means smoltcp connect() rejects with Unaddressable, so
 /// outbound conns need an ephemeral port. Sequential wrap at IANA's dynamic
@@ -53,8 +62,8 @@ pub fn start_connect(
             return;
         }
     };
-    let rx = tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]);
-    let tx = tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]);
+    let rx = tcp::SocketBuffer::new(vec![0u8; SOCK_RX_BUF]);
+    let tx = tcp::SocketBuffer::new(vec![0u8; SOCK_TX_BUF]);
     let mut sock = tcp::Socket::new(rx, tx);
     let remote_ep = IpEndpoint::new(remote_ip, remote.port());
     // IpListenEndpoint::default() is port 0: smoltcp connect() treats a zero
@@ -112,7 +121,7 @@ pub fn service(state: &mut NetState, id: u64) -> bool {
                 conn.established = true;
                 conn.connect_deadline = None;
                 send_result(conn, ConnectResult::Ok);
-                log::info!("conn {} established {}", id, conn.remote);
+                log::debug!("conn {} established {}", id, conn.remote);
             }
             tcp::State::Closed => {
                 send_result(conn, ConnectResult::Refused);
@@ -146,22 +155,35 @@ pub fn service(state: &mut NetState, id: u64) -> bool {
 
     let sock = state.sockets.get_mut::<tcp::Socket>(conn.handle);
 
-    if conn.rx_pipe.len() < RX_PIPE_HEADROOM && sock.can_recv() {
+    // remote -> client: drain the socket into the rx pipe while there is
+    // headroom. Loop, not one fixed chunk: a pass that moves only 16 KiB per
+    // direction caps the whole netloop at chunk * poll rate, far under what
+    // the TCP window now allows.
+    while conn.rx_pipe.len() < RX_PIPE_HEADROOM && sock.can_recv() {
         let mut buf = [0u8; PUMP_CHUNK];
-        if let Ok(n) = sock.recv_slice(&mut buf) {
-            conn.rx_pipe.push(&buf[..n]);
+        let Ok(n) = sock.recv_slice(&mut buf) else {
+            break;
+        };
+        if n == 0 {
+            break;
         }
+        conn.rx_pipe.push(&buf[..n]);
     }
 
     // client -> remote: take only what the socket tx buffer can hold, so a
     // full tx leaves the pipe undrained and the client blocks in push()
-    if sock.can_send() {
+    while sock.can_send() {
         let room = sock.send_capacity() - sock.send_queue();
-        if room > 0 {
-            let data = conn.tx_pipe.take(room.min(PUMP_CHUNK));
-            if !data.is_empty() && sock.send_slice(&data).is_err() {
-                conn.tx_pipe.push_front(&data);
-            }
+        if room == 0 {
+            break;
+        }
+        let data = conn.tx_pipe.take(room.min(PUMP_CHUNK));
+        if data.is_empty() {
+            break;
+        }
+        if sock.send_slice(&data).is_err() {
+            conn.tx_pipe.push_front(&data);
+            break;
         }
     }
 

@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,8 +20,83 @@ impl Deadline {
     }
 }
 
+/// Fixed ring of PIPE_CAP bytes with read/write cursors. Contiguous-span
+/// copies only: a push or take moves bytes with one or two memcpys, never
+/// per-byte deque ops. `front` moves backwards on push_front so a consumer
+/// rollback reuses the space take just vacated.
+struct Ring {
+    buf: Box<[u8]>,
+    front: usize,
+    len: usize,
+}
+
+impl Ring {
+    fn new() -> Ring {
+        Ring {
+            buf: vec![0u8; PIPE_CAP].into_boxed_slice(),
+            front: 0,
+            len: 0,
+        }
+    }
+
+    fn room(&self) -> usize {
+        PIPE_CAP - self.len
+    }
+
+    /// Copy up to `data.len()` bytes in at the tail. Returns bytes written.
+    fn write(&mut self, data: &[u8]) -> usize {
+        let n = data.len().min(self.room());
+        if n == 0 {
+            return 0;
+        }
+        let tail = (self.front + self.len) % PIPE_CAP;
+        let first = (PIPE_CAP - tail).min(n);
+        self.buf[tail..tail + first].copy_from_slice(&data[..first]);
+        if n > first {
+            self.buf[..n - first].copy_from_slice(&data[first..]);
+        }
+        self.len += n;
+        n
+    }
+
+    /// Copy up to `data.len()` bytes in at the head, moving `front` back.
+    /// Returns bytes written. Only valid when headroom exists, which the
+    /// rollback path guarantees: it returns at most what take removed.
+    fn write_front(&mut self, data: &[u8]) -> usize {
+        let n = data.len().min(self.room());
+        if n == 0 {
+            return 0;
+        }
+        self.front = (self.front + PIPE_CAP - n) % PIPE_CAP;
+        let first = (PIPE_CAP - self.front).min(n);
+        self.buf[self.front..self.front + first].copy_from_slice(&data[n - first..]);
+        if n > first {
+            self.buf[PIPE_CAP - (n - first)..].copy_from_slice(&data[..n - first]);
+        }
+        self.len += n;
+        n
+    }
+
+    /// Copy out up to `max` bytes from the head into `out` (pre-sized by the
+    /// caller). Returns bytes read.
+    fn read(&mut self, out: &mut [u8]) -> usize {
+        let n = out.len().min(self.len);
+        if n == 0 {
+            return 0;
+        }
+        let first = (PIPE_CAP - self.front).min(n);
+        out[..first].copy_from_slice(&self.buf[self.front..self.front + first]);
+        if n > first {
+            out[first..].copy_from_slice(&self.buf[..n - first]);
+        }
+        self.front = (self.front + n) % PIPE_CAP;
+        self.len -= n;
+        n
+    }
+}
+
 struct PipeState {
-    buf: VecDeque<u8>,
+    ring: Ring,
     closed: bool,
 }
 
@@ -44,7 +118,7 @@ impl Pipe {
     pub fn new() -> Self {
         Pipe {
             state: Mutex::new(PipeState {
-                buf: VecDeque::with_capacity(PIPE_CAP),
+                ring: Ring::new(),
                 closed: false,
             }),
             cv: Condvar::new(),
@@ -58,12 +132,8 @@ impl Pipe {
         if st.closed {
             return 0;
         }
-        let room = PIPE_CAP - st.buf.len();
-        let n = room.min(data.len());
+        let n = st.ring.write(data);
         if n > 0 {
-            for b in &data[..n] {
-                st.buf.push_back(*b);
-            }
             self.cv.notify_all();
         }
         n
@@ -83,14 +153,8 @@ impl Pipe {
             if st.closed {
                 return false;
             }
-            let room = PIPE_CAP - st.buf.len();
-            if room > 0 {
-                let n = room.min(data.len() - offset);
-                let tail: Vec<u8> = data[offset..offset + n].to_vec();
-                for b in tail {
-                    st.buf.push_back(b);
-                }
-                offset += n;
+            if st.ring.room() > 0 {
+                offset += st.ring.write(&data[offset..]);
                 if offset == data.len() {
                     self.cv.notify_all();
                     return true;
@@ -119,18 +183,19 @@ impl Pipe {
             return;
         }
         let mut st = self.state.lock().unwrap();
-        for b in data.iter().rev() {
-            st.buf.push_front(*b);
-        }
+        let n = st.ring.write_front(data);
+        debug_assert_eq!(n, data.len(), "push_front beyond pipe capacity");
         self.cv.notify_all();
     }
 
     /// Consumer side: take up to `max` bytes without blocking.
     pub fn take(&self, max: usize) -> Vec<u8> {
         let mut st = self.state.lock().unwrap();
-        let n = st.buf.len().min(max);
-        let out: Vec<u8> = st.buf.drain(..n).collect();
-        if !out.is_empty() {
+        let n = st.ring.len.min(max);
+        let mut out = vec![0u8; n];
+        let read = st.ring.read(&mut out);
+        debug_assert_eq!(read, n);
+        if n > 0 {
             self.cv.notify_all();
         }
         out
@@ -151,9 +216,11 @@ impl Pipe {
         };
         let mut st = self.state.lock().unwrap();
         loop {
-            if !st.buf.is_empty() {
-                let n = st.buf.len().min(max);
-                let out: Vec<u8> = st.buf.drain(..n).collect();
+            if st.ring.len > 0 {
+                let n = st.ring.len.min(max);
+                let mut out = vec![0u8; n];
+                let read = st.ring.read(&mut out);
+                debug_assert_eq!(read, n);
                 self.cv.notify_all();
                 return Some(out);
             }
@@ -186,7 +253,7 @@ impl Pipe {
     }
 
     pub fn len(&self) -> usize {
-        self.state.lock().unwrap().buf.len()
+        self.state.lock().unwrap().ring.len
     }
 
     pub fn is_empty(&self) -> bool {
@@ -328,5 +395,47 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         p.close();
         assert!(handle.join().unwrap());
+    }
+
+    #[test]
+    fn ring_wraparound_preserves_order() {
+        let p = Pipe::new();
+        // park the front mid-ring so writes and reads both wrap
+        let warm = vec![1u8; PIPE_CAP - 100];
+        assert!(p.push(&warm));
+        let drained = p.take(PIPE_CAP - 100);
+        assert_eq!(drained.len(), PIPE_CAP - 100);
+        let a = vec![2u8; 150];
+        let b = vec![3u8; 150];
+        assert!(p.push(&a));
+        assert!(p.push(&b));
+        let out = p.take(PIPE_CAP);
+        assert_eq!(out.len(), 300);
+        assert_eq!(&out[..150], &a[..]);
+        assert_eq!(&out[150..], &b[..]);
+    }
+
+    #[test]
+    fn push_front_after_take_restores_exact_bytes() {
+        let p = Pipe::new();
+        let payload: Vec<u8> = (0..=255).cycle().take(300).collect();
+        assert!(p.push(&payload));
+        let taken = p.take(300);
+        p.push_front(&taken);
+        assert_eq!(p.take(PIPE_CAP), payload);
+    }
+
+    #[test]
+    fn push_front_wrapped_restores_exact_bytes() {
+        let p = Pipe::new();
+        // move front near the end so write_front has to split its copy
+        let warm = vec![0u8; PIPE_CAP - 8];
+        assert!(p.push(&warm));
+        p.take(PIPE_CAP - 8);
+        let payload = vec![5u8; 32];
+        assert!(p.push(&payload));
+        let taken = p.take(32);
+        p.push_front(&taken);
+        assert_eq!(p.take(PIPE_CAP), payload);
     }
 }

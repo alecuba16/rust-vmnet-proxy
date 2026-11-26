@@ -9,7 +9,7 @@ use crate::netloop::NetApi;
 use crate::pipe::Deadline;
 
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
-const SPLICE_CHUNK: usize = 16 * 1024;
+const SPLICE_CHUNK: usize = 64 * 1024;
 
 /// Loop timing knobs for the listener and splice threads (from power_mode).
 #[derive(Debug, Clone)]
@@ -234,7 +234,7 @@ fn handle_client(mut client: TcpStream, api: NetApi, tuning: SocksTuning) {
         return;
     }
 
-    log::info!("CONNECT {}:{port} -> {remote} [direct]", host_label);
+    log::debug!("CONNECT {}:{port} -> {remote} [direct]", host_label);
 
     // Classic per-direction splice: a blocking client read in the same loop
     // as the rx drain deadlocks (responses pile up in rx while the thread
