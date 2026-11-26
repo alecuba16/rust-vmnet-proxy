@@ -2,12 +2,46 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::sync::{Arc, Mutex};
 
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 use smoltcp::wire::Ipv4Address;
 
 const FRAME_MAX: usize = 65535;
+
+/// Recycled frame buffers. The netloop thread owns the device and every
+/// token, so pool lock is never contended (a single CAS on the fast path);
+/// RX and TX allocations recycle through it instead of hitting the
+/// allocator per frame. Vectors keep their capacity on recycle. Arc<Mutex>
+/// rather than Rc<RefCell> only because the device crosses a thread
+/// boundary at spawn.
+type FramePool = Arc<Mutex<Vec<Vec<u8>>>>;
+
+fn frame_pool() -> FramePool {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+/// Take a frame buffer of at least `len` bytes from the pool, or allocate.
+fn pool_take(pool: &FramePool, len: usize) -> Vec<u8> {
+    let mut pool = pool.lock().unwrap();
+    match pool.pop() {
+        Some(mut v) if v.capacity() >= len => {
+            v.clear();
+            v.resize(len, 0);
+            v
+        }
+        _ => vec![0u8; len],
+    }
+}
+
+/// Return a frame buffer to the pool, keeping capacity for reuse.
+fn pool_put(pool: &FramePool, v: Vec<u8>) {
+    let mut pool = pool.lock().unwrap();
+    if pool.len() < 64 {
+        pool.push(v);
+    }
+}
 
 /// Ethernet frame pipe to the root socket_vmnet daemon.
 ///
@@ -24,6 +58,7 @@ pub struct VmnetDevice {
     /// Partially written message (header + frame, raw bytes). Written out
     /// before any new framed message; never re-prefixed.
     tx_residual: Vec<u8>,
+    pool: FramePool,
     local_mac: [u8; 6],
     /// Frames handed to smoltcp since boot, after the MAC filter. The rx
     /// watchdog samples it around iface.poll() to see if anything arrived.
@@ -58,12 +93,20 @@ pub struct VmnetDevice {
 
 pub struct PhysRxToken {
     frame: Vec<u8>,
+    pool: FramePool,
 }
 
 pub struct PhysTxToken<'a> {
     frames: &'a mut VecDeque<Vec<u8>>,
     arp_reqs: &'a mut u64,
     arp_target: Option<Ipv4Address>,
+    pool: FramePool,
+}
+
+impl Drop for PhysRxToken {
+    fn drop(&mut self) {
+        pool_put(&self.pool, std::mem::take(&mut self.frame));
+    }
 }
 
 impl RxToken for PhysRxToken {
@@ -80,7 +123,7 @@ impl TxToken for PhysTxToken<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut frame = vec![0u8; len];
+        let mut frame = pool_take(&self.pool, len);
         let result = f(&mut frame);
         // ARP REQUEST on the wire (ethertype 0x0806, opcode 1 at frame
         // offsets 20..22, target protocol address at 38..42, full frame
@@ -121,6 +164,7 @@ impl VmnetDevice {
             rx_frames: VecDeque::new(),
             tx_frames: VecDeque::new(),
             tx_residual: Vec::new(),
+            pool: frame_pool(),
             local_mac,
             rx_taken: 0,
             rx_unicast: 0,
@@ -207,7 +251,10 @@ impl VmnetDevice {
                         if self.rx_buf.len() - self.rx_pos < 4 + len {
                             break;
                         }
-                        let frame = self.rx_buf[self.rx_pos + 4..self.rx_pos + 4 + len].to_vec();
+                        let mut frame = pool_take(&self.pool, len);
+                        frame.copy_from_slice(
+                            &self.rx_buf[self.rx_pos + 4..self.rx_pos + 4 + len],
+                        );
                         self.rx_pos += 4 + len;
                         self.rx_frames.push_back(frame);
                     }
@@ -225,12 +272,18 @@ impl VmnetDevice {
         }
     }
 
-    /// Push all pending tx frames down the socket, one write per message
-    /// (header + frame contiguous: the daemon asserts a full frame per read,
-    /// and split writes could interleave under load). Frames go out FIFO.
-    /// A short write or EAGAIN parks the unwritten tail in tx_residual as
-    /// raw bytes; the next pass writes the residual verbatim before any new
-    /// message, so the 4-byte header is never re-prefixed.
+    /// Push all pending tx frames down the socket, one write per message.
+    /// The daemon (socket_vmnet main.c) reads a 4-byte header then the body
+    /// with a single read() and asserts the body came back whole. read()
+    /// on a blocking fd returns on ANY available byte count, so a batched
+    /// multi-frame write that fills the receive buffer mid-frame hands the
+    /// daemon a truncated body and aborts it (observed: SIGABRT
+    /// assert(received == header) under 4x parallel load). One write per
+    /// message keeps each frame contiguous in the receive buffer; a small
+    /// write either lands whole or gets EAGAIN. A short write or EAGAIN
+    /// parks the unwritten tail in tx_residual as raw bytes; the next pass
+    /// writes the residual verbatim before any new message, so the 4-byte
+    /// header is never re-prefixed.
     pub fn flush_tx(&mut self) -> std::io::Result<()> {
         if !self.tx_residual.is_empty() {
             match self.stream.write(&self.tx_residual) {
@@ -262,9 +315,10 @@ impl VmnetDevice {
                 }
                 Ok(n) if n < msg.len() => {
                     self.tx_residual = msg[n..].to_vec();
+                    pool_put(&self.pool, frame);
                     return Ok(());
                 }
-                Ok(_) => {}
+                Ok(_) => pool_put(&self.pool, frame),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     self.tx_frames.push_front(frame);
                     return Ok(());
@@ -298,11 +352,13 @@ impl Device for VmnetDevice {
         // for our MAC (or broadcast/multicast) is found.
         while let Some(frame) = self.rx_frames.pop_front() {
             if frame.len() < 14 {
+                pool_put(&self.pool, frame);
                 continue;
             }
             let dst = &frame[0..6];
             let multicast = dst[0] & 1 == 1;
             if dst != self.local_mac && !multicast {
+                pool_put(&self.pool, frame);
                 continue;
             }
             if dst == self.local_mac {
@@ -328,11 +384,15 @@ impl Device for VmnetDevice {
                 }
             }
             self.rx_taken += 1;
-            let rx = PhysRxToken { frame };
+            let rx = PhysRxToken {
+                frame,
+                pool: Arc::clone(&self.pool),
+            };
             let tx = PhysTxToken {
                 frames: &mut self.tx_frames,
                 arp_reqs: &mut self.tx_arp_req,
                 arp_target: self.arp_target,
+                pool: Arc::clone(&self.pool),
             };
             return Some((rx, tx));
         }
@@ -344,6 +404,7 @@ impl Device for VmnetDevice {
             frames: &mut self.tx_frames,
             arp_reqs: &mut self.tx_arp_req,
             arp_target: self.arp_target,
+            pool: Arc::clone(&self.pool),
         })
     }
 

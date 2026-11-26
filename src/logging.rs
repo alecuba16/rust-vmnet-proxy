@@ -3,11 +3,16 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::Logging;
 
 pub const LOG_FILE: &str = "rust-vmnet-proxy.log";
+
+/// Staged lines are flushed when the buffer reaches this size.
+const FLUSH_BYTES: usize = 8 * 1024;
+/// Staged lines are flushed when the oldest has waited this long.
+const FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 
 /// File sink with rotation. Written lines carry the env_logger-style
 /// `[timestamp LEVEL target]` prefix; rotation renames to .1, .2, ... and
@@ -19,6 +24,13 @@ struct Sink {
     keep: u32,
     max_bytes: u64,
     written: u64,
+    /// Staged, unwritten bytes. Flushed on size, age, warn+ lines, and
+    /// rotation; per-line flush syscalls were a measured hot path at
+    /// trace level (26% of netloop samples in write(2)).
+    pending: Vec<u8>,
+    /// When the oldest pending byte was staged; None when nothing is
+    /// staged.
+    pending_since: Option<Instant>,
     /// Rotation age anchor: mtime of the file we opened, so restarts don't
     /// reset the rotation clock of a long-lived log.
     opened_at: SystemTime,
@@ -46,15 +58,56 @@ impl Sink {
             keep: 0,
             max_bytes: 0,
             written,
+            pending: Vec::new(),
+            pending_since: None,
             opened_at,
         })
     }
 
     fn write_line(&mut self, line: &str) {
         let Some(f) = &mut self.file else { return };
-        let _ = f.write_all(line.as_bytes());
-        let _ = f.flush();
-        self.written += line.len() as u64;
+        self.pending.extend_from_slice(line.as_bytes());
+        if self.pending_since.is_none() {
+            self.pending_since = Some(Instant::now());
+        }
+        // warn and above never wait in the staging buffer: an operator
+        // tailing the log or a crash right after must see them promptly.
+        let urgent = line.contains(" WARN ") || line.contains(" ERROR ");
+        let aged = self
+            .pending_since
+            .is_some_and(|t| t.elapsed() >= FLUSH_INTERVAL);
+        if urgent || aged || self.pending.len() >= FLUSH_BYTES {
+            let _ = f.write_all(&self.pending);
+            let _ = f.flush();
+            self.written += self.pending.len() as u64;
+            self.pending.clear();
+            self.pending_since = None;
+        }
+        if self.needs_rotation() {
+            self.rotate();
+        }
+    }
+
+    /// Write staged bytes to the file. No rotation logic: rotate()
+    /// calls this before swapping files.
+    fn write_pending(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        if let Some(f) = &mut self.file {
+            let _ = f.write_all(&self.pending);
+            let _ = f.flush();
+            self.written += self.pending.len() as u64;
+        }
+        self.pending.clear();
+        self.pending_since = None;
+    }
+
+    /// Push staged bytes out and enforce the size cap. The cap must hold
+    /// at flush time (when bytes actually land), not just per line: staged
+    /// lines can push written far past max_bytes between checks.
+    fn flush_pending(&mut self) {
+        self.write_pending();
         if self.needs_rotation() {
             self.rotate();
         }
@@ -77,6 +130,7 @@ impl Sink {
     /// rust-vmnet-proxy.log -> .1, old .1 -> .2, ... oldest beyond `keep`
     /// falls off. keep=0 deletes the log instead of renaming it.
     fn rotate(&mut self) {
+        self.write_pending();
         if let Some(f) = self.file.take() {
             let _ = f.sync_all();
         }
@@ -166,6 +220,7 @@ impl log::Log for Logger {
 
     fn flush(&self) {
         if let Ok(mut sink) = self.sink.lock() {
+            sink.flush_pending();
             if let Some(f) = &mut sink.file {
                 let _ = f.flush();
             }
@@ -217,6 +272,8 @@ fn openless_defaults() -> Sink {
         keep: 0,
         max_bytes: 0,
         written: 0,
+        pending: Vec::new(),
+        pending_since: None,
         opened_at: SystemTime::now(),
     }
 }
@@ -246,9 +303,12 @@ mod tests {
     fn size_cap_rotates_and_shifts() {
         let d = tmpdir("size");
         let mut s = sink_for(&d, 0, 3, 60);
-        // each line ~45 bytes; force several rotations
+        // each line ~45 bytes; force several rotations. Rotation checks
+        // run per write_line, but staged bytes only land on flush
+        // triggers, so drive each write to its flush explicitly.
         for i in 0..10 {
             s.write_line(&format!("[line {i} {PAD}]\n"));
+            s.flush_pending();
         }
         assert!(d.join(LOG_FILE).exists());
         assert!(d.join(format!("{LOG_FILE}.1")).exists());
@@ -266,9 +326,36 @@ mod tests {
         let mut s = sink_for(&d, 0, 0, 40);
         for i in 0..6 {
             s.write_line(&format!("[x {i} {PAD}]\n"));
+            s.flush_pending();
         }
         assert!(!d.join(format!("{LOG_FILE}.1")).exists());
         assert!(d.join(LOG_FILE).exists());
+    }
+
+    #[test]
+    fn staged_lines_flush_on_size() {
+        let d = tmpdir("stage");
+        let mut s = sink_for(&d, 0, 3, 0);
+        // under the size and age thresholds, and not urgent: stays staged
+        s.write_line("[quiet line]\n");
+        assert!(s.pending.len() > 0);
+        assert_eq!(std::fs::read_to_string(d.join(LOG_FILE)).unwrap(), "");
+        // past FLUSH_BYTES: lands in the file
+        let big = format!("[{} {}]\n", "x".repeat(FLUSH_BYTES), "y");
+        s.write_line(&big);
+        assert!(s.pending.is_empty());
+        let all = std::fs::read_to_string(d.join(LOG_FILE)).unwrap();
+        assert!(all.contains("quiet line"));
+    }
+
+    #[test]
+    fn warn_lines_flush_immediately() {
+        let d = tmpdir("urgent");
+        let mut s = sink_for(&d, 0, 3, 0);
+        s.write_line("[2026-11-27 00:00:00  WARN  x] bad thing\n");
+        assert!(s.pending.is_empty());
+        let all = std::fs::read_to_string(d.join(LOG_FILE)).unwrap();
+        assert!(all.contains("bad thing"));
     }
 
     #[test]
@@ -276,6 +363,7 @@ mod tests {
         let d = tmpdir("time");
         let mut s = sink_for(&d, 3600, 3, 0);
         s.write_line("young file stays\n");
+        s.flush_pending();
         assert!(!d.join(format!("{LOG_FILE}.1")).exists());
         // age the anchor past the window: next write must rotate
         s.opened_at = SystemTime::now() - std::time::Duration::from_secs(3601);
@@ -291,6 +379,7 @@ mod tests {
         std::fs::write(d.join(LOG_FILE), "previous run\n").unwrap();
         let mut s = sink_for(&d, 0, 3, 0);
         s.write_line("new run\n");
+        s.flush_pending();
         let all = std::fs::read_to_string(d.join(LOG_FILE)).unwrap();
         assert!(all.contains("previous run"));
         assert!(all.contains("new run"));
@@ -302,6 +391,7 @@ mod tests {
         let mut s = sink_for(&d, 0, 3, 0);
         for i in 0..50 {
             s.write_line(&format!("[unbounded {i} {PAD}]\n"));
+            s.flush_pending();
         }
         assert!(!d.join(format!("{LOG_FILE}.1")).exists());
     }
