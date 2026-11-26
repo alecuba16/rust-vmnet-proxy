@@ -121,7 +121,7 @@ pub fn service(state: &mut NetState, id: u64) -> bool {
                 conn.established = true;
                 conn.connect_deadline = None;
                 send_result(conn, ConnectResult::Ok);
-                log::info!("conn {} established {}", id, conn.remote);
+                log::debug!("conn {} established {}", id, conn.remote);
             }
             tcp::State::Closed => {
                 send_result(conn, ConnectResult::Refused);

@@ -338,7 +338,7 @@ mod tests {
         let mut s = sink_for(&d, 0, 3, 0);
         // under the size and age thresholds, and not urgent: stays staged
         s.write_line("[quiet line]\n");
-        assert!(s.pending.len() > 0);
+        assert!(!s.pending.is_empty());
         assert_eq!(std::fs::read_to_string(d.join(LOG_FILE)).unwrap(), "");
         // past FLUSH_BYTES: lands in the file
         let big = format!("[{} {}]\n", "x".repeat(FLUSH_BYTES), "y");

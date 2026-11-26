@@ -252,9 +252,7 @@ impl VmnetDevice {
                             break;
                         }
                         let mut frame = pool_take(&self.pool, len);
-                        frame.copy_from_slice(
-                            &self.rx_buf[self.rx_pos + 4..self.rx_pos + 4 + len],
-                        );
+                        frame.copy_from_slice(&self.rx_buf[self.rx_pos + 4..self.rx_pos + 4 + len]);
                         self.rx_pos += 4 + len;
                         self.rx_frames.push_back(frame);
                     }

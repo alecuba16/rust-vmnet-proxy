@@ -234,7 +234,7 @@ fn handle_client(mut client: TcpStream, api: NetApi, tuning: SocksTuning) {
         return;
     }
 
-    log::info!("CONNECT {}:{port} -> {remote} [direct]", host_label);
+    log::debug!("CONNECT {}:{port} -> {remote} [direct]", host_label);
 
     // Classic per-direction splice: a blocking client read in the same loop
     // as the rx drain deadlocks (responses pile up in rx while the thread
