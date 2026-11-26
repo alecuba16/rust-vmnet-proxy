@@ -111,6 +111,18 @@ pub fn render_plist(prefix: &str, interface: &str, socket_path: &str) -> String 
         .parent()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "/private/var/run".to_string());
+    // Boot race (seen live 2026-11-26): RunAtLoad fired at 20:49:03 while
+    // the en0 Wi-Fi link was still INACTIVE (associated 20:49:10). vmnet_start
+    // never completed on the dead interface, the daemon never reached accept(),
+    // and the proxy burned its 60s vmnet retry budget into a socket nobody
+    // read. KeepAlive cannot self-heal that: the process is alive, so it must
+    // never be started against a link that is down. ifconfig exits nonzero
+    // while the interface is missing/inactive and turns zero once the link is
+    // up, so loop on it (unbounded: launchd KeepAlive owns failure if exec
+    // itself dies, and a down interface is never the right moment to exec).
+    let link_wait = format!(
+        "until ifconfig {interface} 2>/dev/null | /usr/bin/grep -q 'status: active'; do /bin/sleep 1; done"
+    );
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -122,7 +134,7 @@ pub fn render_plist(prefix: &str, interface: &str, socket_path: &str) -> String 
          \t<array>\n\
          \t\t<string>/bin/sh</string>\n\
          \t\t<string>-c</string>\n\
-         \t\t<string>/bin/mkdir -p {parent} &amp;&amp; exec {prog} --vmnet-mode=bridged --vmnet-interface={interface} {socket_path}</string>\n\
+                 \t\t<string>/bin/mkdir -p {parent} &amp;&amp; {link_wait} &amp;&amp; exec {prog} --vmnet-mode=bridged --vmnet-interface={interface} {socket_path}</string>\n\
          \t</array>\n\
          \t<key>RunAtLoad</key>\n\
          \t<true/>\n\

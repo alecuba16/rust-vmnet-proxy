@@ -12,7 +12,7 @@ fn plist_contains_pinned_shape() {
     assert!(plist.contains("<string>com.alecuba16.rust-vmnet-proxy-vmnet</string>"));
     assert!(plist.contains("<string>/bin/sh</string>"));
     assert!(plist.contains("<string>-c</string>"));
-    assert!(plist.contains("/bin/mkdir -p /private/var/run/lima &amp;&amp; exec /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet --vmnet-mode=bridged --vmnet-interface=en7 /private/var/run/lima/socket_vmnet.bridged"));
+    assert!(plist.contains("/bin/mkdir -p /private/var/run/lima &amp;&amp; until ifconfig en7 2>/dev/null | /usr/bin/grep -q 'status: active'; do /bin/sleep 1; done &amp;&amp; exec /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet --vmnet-mode=bridged --vmnet-interface=en7 /private/var/run/lima/socket_vmnet.bridged"));
     assert!(plist.contains("<key>RunAtLoad</key>"));
     assert!(plist.contains("<key>KeepAlive</key>"));
     assert!(plist.contains("<string>root</string>"));
